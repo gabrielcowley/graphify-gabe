@@ -839,15 +839,15 @@ def extract_rust(path: Path) -> dict:
 
     def _scan_type_items(node) -> None:
         t = node.type
-        if t in ("struct_item", "enum_item", "trait_item", "function_item",
-                 "function_signature_item", "static_item", "const_item"):
+        if t in ("struct_item", "enum_item", "trait_item", "union_item", "type_item",
+                 "function_item", "function_signature_item", "static_item", "const_item"):
             name_node = node.child_by_field_name("name")
             if name_node:
                 name = _read_text(name_node, source)
                 if t in ("static_item", "const_item") and name == "_":
                     return
                 nid = _make_id(stem, name)
-                is_type = t in ("struct_item", "enum_item", "trait_item")
+                is_type = t in ("struct_item", "enum_item", "trait_item", "union_item", "type_item")
                 items_by_id.setdefault(nid, set()).add((is_type, name))
                 if is_type:
                     declared_type_names.setdefault(nid, set()).add(name)
@@ -909,14 +909,15 @@ def extract_rust(path: Path) -> dict:
             # file's path (with extension) into the id and blocks the rewire, which is
             # the phantom-duplicate-node bug (#1402).
             seen_ids.add(nid)
-            nodes.append({
+            node_by_id[nid] = {
                 "id": nid,
                 "label": name,
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
                 "origin_file": str_path,
-            })
+            }
+            nodes.append(node_by_id[nid])
         return nid
 
     def add_type_ref(src_nid: str, ref: tuple[str, str, str], line: int, relation: str = "references",
@@ -1036,7 +1037,13 @@ def extract_rust(path: Path) -> dict:
                     macro_nids_by_name.setdefault(macro_name, macro_nid)
             return
 
-        if t in ("struct_item", "enum_item", "trait_item"):
+        # An associated type in an `impl` body (`type Output = Meters;`) is a
+        # type_item too, but not a file-level item: it would mint one colliding
+        # `Output` node per `impl Add`. Only an alias at module level is one.
+        if t == "type_item" and node.parent is not None and node.parent.parent is not None \
+                and node.parent.parent.type == "impl_item":
+            return
+        if t in ("struct_item", "enum_item", "trait_item", "union_item", "type_item"):
             name_node = node.child_by_field_name("name")
             if name_node:
                 item_name = _read_text(name_node, source)
@@ -1063,7 +1070,7 @@ def extract_rust(path: Path) -> dict:
                                     add_type_ref(item_nid, ref, line, "inherits")
                                 else:
                                     add_type_ref(item_nid, ref, line, context="generic_arg")
-                if t == "struct_item":
+                if t in ("struct_item", "union_item"):
                     struct_generics = _rust_generic_names(node, source)
                     for c in node.children:
                         if c.type != "field_declaration_list":
@@ -1245,7 +1252,7 @@ def extract_rust(path: Path) -> dict:
                         impl_keys[impl_nid] = impl_key
                     elif impl_keys[impl_nid] != impl_key:
                         impl_keys[impl_nid] = None
-                    impl_node = next(n for n in nodes if n["id"] == impl_nid)
+                    impl_node = node_by_id[impl_nid]
                     if impl_keys[impl_nid]:
                         impl_node["_rust_impl_key"] = impl_keys[impl_nid]
                     else:
