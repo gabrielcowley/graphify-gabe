@@ -1020,6 +1020,12 @@ def extract_rust(path: Path) -> dict:
         parent = node.parent
         if parent is None or parent.type in _RUST_NOT_A_REFERENCE_PARENTS:
             return
+        # A struct-style variant or struct by its path: `E::Missing { at }`, as a
+        # value or a pattern.
+        struct_style = node.type == "scoped_type_identifier"
+        if struct_style and parent.child_by_field_name(
+                "name" if parent.type == "struct_expression" else "type") != node:
+            return
         if parent.type == "call_expression" and parent.child_by_field_name("function") == node:
             return
         if parent.type in ("const_item", "static_item") and parent.child_by_field_name("name") == node:
@@ -1032,14 +1038,17 @@ def extract_rust(path: Path) -> dict:
         else:
             segments = _rust_call_path(node, source)
             if not segments or not (_RUST_CONST_NAME.fullmatch(segments[-1]) or (
-                    segments[-1][:1].isupper() and segments[-2][:1].isupper())):
+                    segments[-1][:1].isupper() and (struct_style or segments[-2][:1].isupper()))):
                 return
             if segments[0] == "Self":
                 if not self_type:
                     return
                 segments = (_rust_type_last_segment(self_type), *segments[1:])
-        context = "match" if _rust_in_pattern(node) else (
-            "const" if _RUST_CONST_NAME.fullmatch(segments[-1]) else "variant")
+        if struct_style:
+            context = "match" if parent.type == "struct_pattern" else "constructor"
+        else:
+            context = "match" if _rust_in_pattern(node) else (
+                "const" if _RUST_CONST_NAME.fullmatch(segments[-1]) else "variant")
         if len(segments) == 1:
             tgt_nid = in_file_items.get("::".join([*scope, segments[0]]))
         else:
@@ -1077,7 +1086,9 @@ def extract_rust(path: Path) -> dict:
     ) -> None:
         if node.type in ("function_item", "use_declaration", "attribute_item"):
             return
-        if node.type in ("scoped_identifier", "identifier"):
+        if node.type in ("scoped_identifier", "identifier") or (
+                node.type == "scoped_type_identifier" and node.parent is not None
+                and node.parent.type in ("struct_expression", "struct_pattern")):
             reference(node, caller_nid, self_type, scope)
         if node.type == "macro_invocation":
             # `name!(...)` invoking a macro_rules! macro defined in this file.
