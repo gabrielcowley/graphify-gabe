@@ -139,6 +139,19 @@ def test_a_plain_module_import_is_no_evidence_for_a_bare_call(tmp_path: Path):
     assert all(confidence != "EXTRACTED" for _, confidence in _edges_from(result, "src/user.rs", "calls"))
 
 
+def test_a_glob_of_its_own_file_is_dropped(tmp_path: Path):
+    # `use super::*;` in a file's inline test module imports that file: no edge, and
+    # no `super` stub left holding it.
+    result = _extract(tmp_path, {
+        "Cargo.toml": '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": "pub mod util;\n",
+        "src/util.rs": "pub fn helper() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n"
+                       "    fn uses() {\n        helper();\n    }\n}\n"})
+    assert _edges_from(result, "src/util.rs", "imports_from") == []
+    assert "super" not in {n["id"] for n in result["nodes"]}
+    assert (_nid(result, "helper()", "src/util.rs"), "EXTRACTED") in _edges_from(result, "src/util.rs", "calls")
+
+
 # --- the index on its own: what resolves to nothing ---
 
 _INDEX = {
