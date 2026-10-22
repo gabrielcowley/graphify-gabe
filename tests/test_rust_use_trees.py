@@ -102,13 +102,15 @@ def test_each_binding_gets_the_plain_use_target(tmp_path: Path):
     edges = sorted((e["relation"], e["target"], e["source_location"]) for e in result["edges"]
                    if e.get("context") == "import")
     assert edges == sorted([
-        # `parse` and `render` are declared once in the corpus, so they land there (#4439)
-        ("imports_from", "util", "L1"), ("imports_from", "src_util_parse", "L1"), ("imports_from", "src_util_render", "L1"),
+        # Each path is resolved through the crate (graphify/rust_paths.py): `util` is
+        # util.rs's file node and `parse` and `render` its items. `util::nested` names
+        # nothing in the crate, so those two keep v8's target.
+        ("imports_from", "src_util", "L1"), ("imports_from", "src_util_parse", "L1"), ("imports_from", "src_util_render", "L1"),
         ("imports_from", "deep", "L1"), ("imports_from", "nested", "L1"), ("imports_from", "b", "L2"),
         ("imports_from", "c", "L2"),
-        # plain declarations, exactly as v8 emits them
+        # plain declarations: other crates' paths exactly as v8 emits them
         ("imports_from", "src_util_parse", "L3"), ("imports_from", "read", "L4"), ("imports_from", "bar_as_baz", "L5"),
-        ("imports_from", "util", "L6"), ("imports_from", "fmt", "L7")])
+        ("imports_from", "src_util", "L6"), ("imports_from", "fmt", "L7")])
     sources = {e["source"] for e in result["edges"] if e.get("context") == "import"}
     file_node = next(n["id"] for n in result["nodes"] if n.get("label") == "user.rs")
     assert sources == {file_node}
@@ -229,11 +231,12 @@ def test_a_use_lands_on_the_declaration_without_an_annotation(tmp_path: Path):
     assert not any(k.startswith("_rust_use") for n in result["nodes"] for k in n)
 
 
-def test_a_use_of_a_name_declared_twice_stays_unresolved(tmp_path: Path):
+def test_a_use_of_a_name_declared_twice_lands_where_its_path_says(tmp_path: Path):
+    # By name alone (#4439) this stayed unresolved; the path names a.rs's.
     result = _extract(tmp_path, {
         "src/lib.rs": "pub mod a;\npub mod b;\npub mod user;\n", "src/a.rs": "pub struct Thing;\n",
         "src/b.rs": "pub struct Thing;\n", "src/user.rs": "use crate::a::Thing;\n"})
-    assert _imports(result, "user.rs") == ["thing"]
+    assert _imports(result, "user.rs") == ["src_a_thing"]
 
 
 def test_a_use_from_another_crate_does_not_land_on_a_same_named_declaration(tmp_path: Path):

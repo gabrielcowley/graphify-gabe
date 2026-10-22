@@ -2035,6 +2035,7 @@ def _rebuild_code(
                     for marker in (
                         "_callable", "_callable_class", "_elixir_module",
                         "_rust_impl_key", "_rust_declaration_count",
+                        "_rust_paths", "_rust_mods", "_rust_inline_mods", "_rust_imports",
                         "_ts_public_twin", "_py_property", "_java_ret",
                         "_ts_fields", "_ts_static_fields",
                         "_py_fixture",
