@@ -218,12 +218,15 @@ def retarget_use_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> 
     whole file gives the edge that file's node; only a glob of it
     (`use crate::util::*;`) brings names into scope, so only a glob is marked
     `"module"` evidence, and any other module import `"none"`. A resolved edge
-    drops `_rust_use_name`, so #4439's by-name rewire only sees the rest.
+    drops `_rust_use_name`, so #4439's by-name rewire only sees the rest. A `use`
+    of the file it is written in (`use super::*;` in the file's inline
+    `mod tests`) says nothing, and is dropped rather than left on a `super` stub.
     """
     pending = [e for e in edges if e.get("_rust_use_path")]
     if not pending:
         return
     index = RustPathIndex(nodes, root)
+    own_file: set[int] = set()
     for edge in pending:
         path = str(edge["_rust_use_path"])
         glob = path.endswith("*")
@@ -239,7 +242,10 @@ def retarget_use_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> 
                 continue
             new_target, evidence = file_node, "module" if glob else "none"
         if new_target == edge.get("source"):
+            own_file.add(id(edge))
             continue
         edge["target"] = new_target
         edge["_rust_use_evidence"] = evidence
         edge.pop("_rust_use_name", None)
+    if own_file:
+        edges[:] = [e for e in edges if id(e) not in own_file]
