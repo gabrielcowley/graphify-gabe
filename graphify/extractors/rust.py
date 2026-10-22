@@ -161,11 +161,23 @@ def _rust_use_module(argument: str) -> str:
     return clean.split("::")[-1].strip()
 
 
-def _rust_use_bindings(node, source: bytes, prefix: str = "", self_path: str = "") -> list[tuple[str, int]]:
+def _rust_path_segments(text: str) -> tuple[str, ...]:
+    """A path as written, as its segments: comments and spacing dropped, `r#type` read
+    as `type`, and a leading `::` (always a crate name) kept as an empty first segment.
+    `crate :: a::/* x */b` gives `("crate", "a", "b")`; a glob ends in `"*"`."""
+    text = re.sub(r"\s+", "", re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)).rstrip("{").rstrip(":")
+    lead: tuple[str, ...] = ()
+    if text.startswith("::"):
+        lead, text = ("",), text[2:]
+    return lead + tuple(s[2:] if s.startswith("r#") else s for s in text.split("::") if s) if text else lead
+
+
+def _rust_use_bindings(node, source: bytes, prefix: str = "", self_path: str = "") -> list[tuple[str, int, tuple[str, ...], str]]:
     """Each binding of a `use` tree, as the argument of a plain `use` that binds the same
     name, with its line: `a::{b, c as d, e::{self}, f::*}` gives `b`, `c as d`, `a::e`
     and `f::*` (as `use a::b;` and so on would: only the last segment counts). Paths
-    keep their text as written."""
+    keep their text as written. Each also carries its whole path as segments
+    (`_rust_path_segments`) and the name it binds: `d` for `c as d`, `*` for a glob."""
     t, line = node.type, node.start_point[0] + 1
     if t == "use_list":
         return [binding for child in node.named_children for binding in _rust_use_bindings(child, source, prefix, self_path)]
@@ -174,15 +186,32 @@ def _rust_use_bindings(node, source: bytes, prefix: str = "", self_path: str = "
         lead = prefix + source[node.start_byte:group.start_byte].decode("utf-8", errors="replace") if group is not None else ""
         owner = prefix + _read_text(path, source) if path is not None else ""
         return _rust_use_bindings(group, source, lead, owner) if group is not None else []
-    alias = ""
+    alias, bound = "", None
     if t == "use_as_clause":
         clause, node = node, node.child_by_field_name("path")
         alias = source[node.end_byte:clause.end_byte].decode("utf-8", errors="replace") if node is not None else ""
+        alias_node = clause.child_by_field_name("alias")
+        bound = _read_text(alias_node, source) if alias_node is not None else None
     if node is not None and node.type == "self" and self_path:  # `a::{self}` binds `a`
-        return [(self_path + alias, line)]
+        segments = _rust_path_segments(self_path)
+        return [(self_path + alias, line, segments, bound or (segments[-1] if segments else ""))]
     if node is not None and node.type in ("use_wildcard", "identifier", "scoped_identifier", "crate", "self", "super"):
-        return [(prefix + _read_text(node, source) + alias, line)]
+        segments = _rust_path_segments(prefix + _read_text(node, source))
+        return [(prefix + _read_text(node, source) + alias, line, segments, bound or (segments[-1] if segments else ""))]
     return []
+
+
+def _rust_path_attribute(mod_node, source: bytes) -> str:
+    """The file a `#[path = "…"]` above a `mod x;` names, or "" when it has none. Other
+    attributes and comments between them are skipped; `cfg_attr(…, path = …)` is not read."""
+    sibling = mod_node.prev_named_sibling
+    while sibling is not None and sibling.type in ("attribute_item", "line_comment", "block_comment"):
+        if sibling.type == "attribute_item":
+            match = re.fullmatch(r'#\[\s*path\s*=\s*"([^"\\]*)"\s*\]', _read_text(sibling, source).strip())
+            if match:
+                return match.group(1)
+        sibling = sibling.prev_named_sibling
+    return ""
 
 
 _RUST_TRAIT_METHOD_BLOCKLIST: frozenset[str] = frozenset({
@@ -285,6 +314,15 @@ def extract_rust(path: Path) -> dict:
     # define, so an in-file `Type::f()` / `self.f()` binds to a method of that type.
     impl_methods: dict[tuple[str, str], set[str]] = {}
 
+    # What graphify/rust_paths.py needs to resolve a written path to this file's
+    # items: the inline `mod` blocks walk() is inside, each `mod x;` it declares
+    # (with its `#[path]`), each `use` binding, and each item's path in the file.
+    mod_scope: list[str] = []
+    declared_mods: list[list[str]] = []
+    inline_mods: list[str] = []
+    use_bindings: list[list] = []
+    node_by_id: dict[str, dict] = {}
+
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
@@ -295,6 +333,17 @@ def extract_rust(path: Path) -> dict:
                 "source_file": str_path,
                 "source_location": f"L{line}",
             })
+            node_by_id[nid] = nodes[-1]
+
+    def mark_item_path(nid: str, *names: str) -> None:
+        # Two items can share a node (`fn f` beside `mod tests { fn f }`), so a node
+        # keeps every path it is declared at.
+        node = node_by_id.get(nid)
+        if node is not None:
+            item_path = "::".join([*mod_scope, *names])
+            paths = node.setdefault("_rust_paths", [])
+            if item_path not in paths:
+                paths.append(item_path)
 
     def add_edge(src: str, tgt: str, relation: str, line: int,
                  confidence: str = "EXTRACTED", weight: float = 1.0,
@@ -465,6 +514,7 @@ def extract_rust(path: Path) -> dict:
                     func_nid = file_item_nid(_make_id(stem, func_name), func_name)
                     add_node(func_nid, f"{func_name}()", line)
                     add_edge(file_nid, func_nid, "contains", line)
+                    mark_item_path(func_nid, func_name)
                 emit_param_return_refs(node, func_nid, line)
                 body = node.child_by_field_name("body")
                 if body:
@@ -494,6 +544,7 @@ def extract_rust(path: Path) -> dict:
                     func_nid = file_item_nid(_make_id(stem, func_name), func_name)
                     add_node(func_nid, f"{func_name}()", line)
                     add_edge(file_nid, func_nid, "contains", line)
+                    mark_item_path(func_nid, func_name)
                 emit_param_return_refs(node, func_nid, line)
             return
 
@@ -521,7 +572,8 @@ def extract_rust(path: Path) -> dict:
                 line = node.start_point[0] + 1
                 item_nid = file_item_nid(_make_id(stem, item_name), item_name)
                 add_node(item_nid, item_name, line)
-                declaration_node = next(n for n in nodes if n["id"] == item_nid)
+                mark_item_path(item_nid, item_name)
+                declaration_node = node_by_id[item_nid]
                 declaration_node["_rust_declaration_count"] = (
                     declaration_node.get("_rust_declaration_count", 0) + 1
                 )
@@ -635,6 +687,7 @@ def extract_rust(path: Path) -> dict:
                                     variant_nid = _make_id(item_nid, vname)
                                     add_node(variant_nid, vname, vline)
                                     add_edge(item_nid, variant_nid, "case_of", vline)
+                                    mark_item_path(variant_nid, item_name, vname)
                             for vc in variant.children:
                                 if vc.type == "ordered_field_declaration_list":
                                     for tc in vc.children:
@@ -677,6 +730,7 @@ def extract_rust(path: Path) -> dict:
                     item_nid = file_item_nid(_make_id(stem, item_name), item_name)
                     add_node(item_nid, item_name, line)
                     add_edge(file_nid, item_nid, "contains", line)
+                    mark_item_path(item_nid, item_name)
                 type_node = node.child_by_field_name("type")
                 if type_node is not None:
                     refs: list[tuple[str, str]] = []
@@ -743,6 +797,22 @@ def extract_rust(path: Path) -> dict:
                     )
             return
 
+        if t == "mod_item":
+            name_node = node.child_by_field_name("name")
+            mod_name = _read_text(name_node, source) if name_node is not None else ""
+            if mod_name and node.child_by_field_name("body") is None:
+                # `mod x;` names a file; a `#[path = "…"]` above it names which.
+                declared_mods.append(["::".join(mod_scope), mod_name, _rust_path_attribute(node, source)])
+            elif mod_name:
+                mod_scope.append(mod_name)
+                inline_mods.append("::".join(mod_scope))
+                try:
+                    for child in node.children:
+                        walk(child, parent_impl_nid=None)
+                finally:
+                    mod_scope.pop()
+                return
+
         if t == "use_declaration":
             arg = node.child_by_field_name("argument")
             if arg:
@@ -771,19 +841,38 @@ def extract_rust(path: Path) -> dict:
                         and not path.lstrip().startswith("::")
                     ):
                         edges[-1]["_rust_use_name"] = written.split(" as ")[0].strip()
+
+                def path_use(segments: tuple[str, ...]) -> None:
+                    # The whole path, for graphify/rust_paths.py to resolve from this scope.
+                    if segments:
+                        edges[-1]["_rust_use_path"] = "::".join(segments)
+                        if mod_scope:
+                            edges[-1]["_rust_use_scope"] = "::".join(mod_scope)
+
                 module_name = _rust_use_module(_read_text(arg, source))
                 grouped = arg.type in ("use_list", "scoped_use_list")
+                bindings = _rust_use_bindings(arg, source)
+                is_pub = any(child.type == "visibility_modifier" for child in node.children)
+                for _text, _line, segments, bound in bindings:
+                    use_bindings.append(["::".join(mod_scope), bound, "::".join(segments), is_pub])
                 if module_name:
                     tgt_nid = _make_id(module_name)
                     add_edge(file_nid, tgt_nid, "imports_from", node.start_point[0] + 1, context="import")
                     name_use(module_name, _read_text(arg, source))
                     if grouped:  # call evidence as in v8, then dropped (extract.py)
                         edges[-1]["_rust_use_group"] = True
+                        group = arg.child_by_field_name("list")
+                        if arg.type == "scoped_use_list" and group is not None:
+                            path_use(_rust_path_segments(
+                                source[arg.start_byte:group.start_byte].decode("utf-8", errors="replace")))
+                    elif bindings:
+                        path_use(bindings[0][2])
                 # A group imports what the plain `use` of each of its bindings would.
-                for binding, line in _rust_use_bindings(arg, source) if grouped else []:
+                for binding, line, segments, _bound in bindings if grouped else []:
                     if binding_name := _rust_use_module(binding):
                         add_edge(file_nid, _make_id(binding_name), "imports_from", line, context="import")
                         name_use(binding_name, binding)
+                        path_use(segments)
                         edges[-1]["_rust_use_binding"] = True  # not call evidence: v8 had no such edge
             return
 
@@ -791,6 +880,10 @@ def extract_rust(path: Path) -> dict:
             walk(child, parent_impl_nid=None)
 
     walk(root)
+    for marker, value in (("_rust_mods", declared_mods), ("_rust_inline_mods", inline_mods),
+                          ("_rust_imports", use_bindings)):
+        if value:
+            node_by_id[file_nid][marker] = value
 
     # A bare `f()` can only reach a free function or a type (a tuple struct or
     # variant constructor), and `x.f()` only a method, so each call shape looks up
