@@ -48,7 +48,7 @@ _WORKSPACE = {
         "    pub fn kind(&self) -> &str {\n        match self {\n            Self::BattleNotStated => \"battle\",\n"
         "            Self::Over(_) => \"over\",\n        }\n    }\n}\n"
     ),
-    "a/src/fs.rs": "pub fn read() {}\n",
+    "a/src/fs.rs": "pub fn read() {}\n\npub struct Reader;\n",
     # An associated const in an impl block away from the type's declaration.
     "a/src/floor.rs": "use crate::expect::ExpectError;\n\nimpl ExpectError {\n    pub const FLOOR: u32 = 1;\n}\n",
     "a/src/renamed.rs": "pub fn relocated() {}\n",
@@ -74,7 +74,7 @@ _WORKSPACE = {
     # A same-named Python module beside the crate is never a Rust path's target.
     "util.py": "def helper():\n    pass\n",
     "a/src/session/mod.rs": (
-        "pub fn step() {}\n\npub mod inner {\n    pub fn deep() {}\n}\n\n#[cfg(test)]\nmod tests;\n"
+        "pub fn step() {}\n\npub struct Reader;\n\npub mod inner {\n    pub fn deep() {}\n}\n\n#[cfg(test)]\nmod tests;\n"
     ),
     # `use super::*;` brings the parent's names into scope: module evidence.
     "a/src/session/tests.rs": "use super::*;\n\nfn steps() {\n    step();\n    inner::deep();\n}\n",
@@ -293,6 +293,38 @@ def test_a_struct_style_variant_is_a_reference(tmp_path: Path):
     assert _references_from(result, "cfg()", "src/user.rs") == [(_nid(result, "Cfg", "src/err.rs"), "constructor", "EXTRACTED")]
 
 
+# --- type references ---
+
+def test_a_type_reference_lands_on_the_type_its_path_names(tmp_path: Path):
+    # Two files declare `Flow`: by name alone, the reference stayed a sourceless stub.
+    result = _extract(tmp_path, {
+        "Cargo.toml": '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": "pub mod battle;\npub mod other;\npub mod user;\n",
+        "src/battle.rs": "pub enum Flow {\n    Next,\n}\n\npub trait Codec {}\n",
+        "src/other.rs": "pub struct Flow;\n\npub trait Codec {}\n",
+        "src/user.rs": (
+            "use crate::battle::{Codec, Flow};\nuse std::io::Read;\n\n"
+            "pub struct Step {\n    pub flow: Flow,\n    pub alt: Option<crate::other::Flow>,\n}\n\n"
+            "pub fn run(flow: &Flow, input: &mut dyn Read) -> crate::other::Flow {\n    crate::other::Flow\n}\n\n"
+            "impl Codec for Step {}\n\n"
+            "#[cfg(test)]\nmod tests {\n    use crate::other::Flow;\n\n    fn check(_: Flow) {}\n}\n"
+        )})
+    battle, other = _nid(result, "Flow", "src/battle.rs"), _nid(result, "Flow", "src/other.rs")
+
+    def targets(caller: str) -> set[str]:
+        caller_nid = _nid(result, caller, "src/user.rs")
+        return {e["target"] for e in result["edges"] if e["source"] == caller_nid
+                and e["relation"] in ("references", "implements")}
+
+    assert {battle, other} <= targets("Step")
+    assert {battle, other} <= targets("run()")
+    assert other in targets("check()") and battle not in targets("check()")
+    impl = next(e["target"] for e in result["edges"] if e["relation"] == "implements")
+    assert impl == _nid(result, "Codec", "src/battle.rs")
+    # std's `Read` names nothing in the crate, and no stub is left for `Flow`.
+    assert "flow" not in {n["id"] for n in result["nodes"]}
+
+
 # --- the index on its own: what resolves to nothing ---
 
 _INDEX = {
@@ -378,6 +410,9 @@ def _view(graph: dict) -> tuple:
     ("a/src/expect.rs", _WORKSPACE["a/src/expect.rs"].replace("exceeded", "above")),
     ("a/src/floor.rs", _WORKSPACE["a/src/floor.rs"].replace("FLOOR", "BASE")),
     ("a/src/values.rs", _WORKSPACE["a/src/values.rs"] + "\npub fn more() -> u32 {\n    ExpectError::CAP\n}\n"),
+    # Two `Reader`s: by name alone, neither type reference resolves.
+    ("a/src/values.rs", _WORKSPACE["a/src/values.rs"].replace("use std::cmp::Ordering;\n", "use std::cmp::Ordering;\nuse crate::fs::Reader;\n")
+     + "\npub fn typed(_: Reader, _: crate::session::Reader) {}\n"),
 ])
 def test_an_incremental_build_resolves_what_a_full_one_does(tmp_path: Path, changed: str, text: str):
     root, fresh = tmp_path / "incremental", tmp_path / "fresh"

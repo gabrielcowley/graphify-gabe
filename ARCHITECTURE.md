@@ -160,4 +160,9 @@ named as a value or in a pattern (`Err(E::Missing)`, `E::Missing =>`, `LIMIT`,
 variant or a struct by its path (`E::Missing { at }`) is one with context
 `constructor`, or `match` as a pattern. A macro's
 arguments are an unparsed token tree, so `matches!(e, E::Missing)` gets none.
-AST cache schemas 23 to 25 retire cached Rust results that lack the markers.
+A type reference to a type another file declares (a parameter, field, return
+or generic argument type, a supertrait, an implemented trait) carries the type
+as written, and lands on the struct, enum or trait declaration its path names,
+so `Flow` after `use crate::battle::Flow;` is battle's even when another file
+declares a `Flow` too; a stub the pass empties is dropped.
+AST cache schemas 23 to 26 retire cached Rust results that lack the markers.
