@@ -486,6 +486,9 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     from graphify.paths import write_json_atomic
     # Atomic write: a crash/ENOSPC mid-write must not truncate a good graph.json.
     write_json_atomic(output_path, data, compact=True)
+    if Path(output_path).name == "graph.json":
+        from graphify.hint_index import publish
+        publish(output_path, data.get("nodes"))
     return True
 
 
