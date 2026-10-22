@@ -159,8 +159,9 @@ def _default_graph_path() -> str:
 # A direct label scan of graph.json, not `graphify query`: loading the full query
 # stack costs ~1.5 s on a 15k-node graph, too slow for a per-call hook. The scan
 # costs ~0.5 s on an 18 MiB graph; bigger graphs than the cap get the plain nudge.
-# pokegen3-pin: 32 MiB, not 24. Resolving Rust paths adds edges, not nodes (a
-# 21.9 MB graph became 29.2 MB), and its parse went from 0.17 s to 0.24 s.
+# pokegen3-pin: 32 MiB, not 24. Resolving Rust paths and typed receivers adds
+# edges, not nodes (a 21.9 MB graph became 30.7 MB), and parsing it for a hint
+# went from 0.17 s to about 0.25 s.
 _HINT_MAX_NODES = 5
 _HINT_GRAPH_MAX_BYTES = 32 * 1024 * 1024
 _HINT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
