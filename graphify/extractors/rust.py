@@ -244,6 +244,36 @@ def _rust_qualifier_type(path_node, source: bytes) -> str | None:
     return last if last[:1].isupper() or last in _RUST_PRIMITIVE_TYPES else None
 
 
+def _rust_call_path(func_node, source: bytes) -> tuple[str, ...] | None:
+    """A path callee's segments without generic arguments (`Vec::<u8>::new` gives
+    `("Vec", "new")`), or None for a qualified-self path (`<T as Tr>::f`), which
+    names no item by itself."""
+    text = _read_text(func_node, source).strip()
+    if text.startswith("<"):
+        return None
+    depth, kept = 0, []
+    for ch in text:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(depth - 1, 0)
+        elif depth == 0:
+            kept.append(ch)
+    segments = _rust_path_segments("".join(kept))
+    return segments if len(segments) >= 2 else None
+
+
+def _rust_path_may_be_local(segments: tuple[str, ...], local_types: set[str]) -> bool:
+    """Whether a call path can name a corpus item at all. `Self::f()` is the impl's
+    own method, and `Vec::new()` / `i32::from()` a std one unless the file defines
+    that type itself."""
+    first = segments[0]
+    if first == "Self":
+        return False
+    builtin = first in _RUST_BUILTIN_TYPES or first in _RUST_PRIMITIVE_TYPES
+    return not (len(segments) == 2 and builtin and first not in local_types)
+
+
 def _rust_type_last_segment(text: str) -> str:
     """`crate::a::Foo<T>` -> `Foo`: the last path segment, generic arguments dropped.
     A leading `&`, `&'a mut` or `dyn` (`impl Tr for &'a Foo`) is not part of it."""
@@ -282,7 +312,7 @@ def extract_rust(path: Path) -> dict:
     nodes: list[dict] = []
     edges: list[dict] = []
     seen_ids: set[str] = set()
-    function_bodies: list[tuple[str, object, str | None, str | None]] = []
+    function_bodies: list[tuple[str, object, str | None, str | None, tuple[str, ...]]] = []
     impl_keys: dict[str, str | None] = {}
 
     # Names this file defines as a type (struct/enum/trait/union/alias) before it
@@ -526,6 +556,7 @@ def extract_rust(path: Path) -> dict:
                         body,
                         parent_impl_type,
                         parent_impl_key,
+                        tuple(mod_scope),
                     ))
             return
 
@@ -919,11 +950,35 @@ def extract_rust(path: Path) -> dict:
     seen_call_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
 
+    # This file's items by their path in it, for a module-qualified call that
+    # stays in the file (`self::f()`, `super::f()` from an inline `mod`, `inner::f()`).
+    # A path two nodes share names neither.
+    in_file_items: dict[str, str | None] = {}
+    for n in nodes:
+        for item_path in n.get("_rust_paths") or ():
+            in_file_items[item_path] = n["id"] if in_file_items.get(item_path, n["id"]) == n["id"] else None
+    inline_mod_paths = frozenset(inline_mods)
+
+    def in_file_target(segments: tuple[str, ...], scope: tuple[str, ...]) -> str | None:
+        base, rest = list(scope), list(segments)
+        if rest and rest[0] == "self":
+            rest.pop(0)
+        elif rest and rest[0] == "super":
+            while rest and rest[0] == "super":
+                if not base:
+                    return None  # the parent module is another file
+                base.pop()
+                rest.pop(0)
+        elif not rest or "::".join([*base, rest[0]]) not in inline_mod_paths:
+            return None  # `crate::`, a `use`d name, a file module or another crate
+        return in_file_items.get("::".join(base + rest)) if rest else None
+
     def walk_calls(
         node,
         caller_nid: str,
         self_type: str | None = None,
         self_impl_key: str | None = None,
+        scope: tuple[str, ...] = (),
     ) -> None:
         if node.type == "function_item":
             return
@@ -962,6 +1017,7 @@ def extract_rust(path: Path) -> dict:
             is_scoped_call: bool = False
             is_self_call: bool = False
             qualifier_type: str | None = None
+            call_path: tuple[str, ...] | None = None
             if func_node:
                 if func_node.type == "identifier":
                     callee_name = _read_text(func_node, source)
@@ -974,13 +1030,15 @@ def extract_rust(path: Path) -> dict:
                     if receiver is not None and receiver.type == "self":
                         is_self_call = True
                 elif func_node.type == "scoped_identifier":
-                    # Type::method() — still allow in-file EXTRACTED match, but
-                    # skip cross-file resolution: bare last-segment lookup ignores
-                    # crate boundaries and produces spurious INFERRED edges (#908).
+                    # A path call never reaches the shared cross-file pass: bare
+                    # last-segment lookup ignores crate boundaries and produced
+                    # spurious INFERRED edges (#908). Unbound here, it goes to the
+                    # path resolver (rust_paths.resolve_path_calls) with its path.
                     is_scoped_call = True
                     name = func_node.child_by_field_name("name")
                     if name:
                         callee_name = _read_text(name, source)
+                    call_path = _rust_call_path(func_node, source)
                     qualifier_type = _rust_qualifier_type(func_node.child_by_field_name("path"), source)
                     if qualifier_type == "Self":
                         # A trait's default method has no impl type: "" matches
@@ -1005,6 +1063,11 @@ def extract_rust(path: Path) -> dict:
                         tgt_nid = named if named in type_nids else None
                 elif is_member_call:
                     tgt_nid = method_label_to_nid.get(callee_name)
+                elif is_scoped_call:
+                    # `inner::f()` binds to this file's `inner::f`, never to any `f`
+                    # the file defines: `crate::rng::f()` beside a test module's own
+                    # `f` used to bind to that one.
+                    tgt_nid = in_file_target(call_path, scope) if call_path else None
                 else:
                     tgt_nid = label_to_nid.get(callee_name)
                 if tgt_nid and tgt_nid != caller_nid:
@@ -1023,7 +1086,20 @@ def extract_rust(path: Path) -> dict:
                             "source_location": f"L{line}",
                             "weight": 1.0,
                         })
-                elif not is_scoped_call and callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST:
+                elif is_scoped_call:
+                    if call_path and _rust_path_may_be_local(call_path, local_types):
+                        rc_entry = {
+                            "caller_nid": caller_nid,
+                            "callee": callee_name,
+                            "is_member_call": False,
+                            "rust_path": "::".join(call_path),
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        }
+                        if scope:
+                            rc_entry["rust_scope"] = "::".join(scope)
+                        raw_calls.append(rc_entry)
+                elif callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST:
                     rc_entry = {
                         "caller_nid": caller_nid,
                         "callee": callee_name,
@@ -1037,10 +1113,10 @@ def extract_rust(path: Path) -> dict:
                             rc_entry["rust_self_impl_key"] = self_impl_key
                     raw_calls.append(rc_entry)
         for child in node.children:
-            walk_calls(child, caller_nid, self_type, self_impl_key)
+            walk_calls(child, caller_nid, self_type, self_impl_key, scope)
 
-    for caller_nid, body_node, impl_type, impl_key in function_bodies:
-        walk_calls(body_node, caller_nid, impl_type, impl_key)
+    for caller_nid, body_node, impl_type, impl_key, body_scope in function_bodies:
+        walk_calls(body_node, caller_nid, impl_type, impl_key, body_scope)
 
     valid_ids = seen_ids
     clean_edges = []

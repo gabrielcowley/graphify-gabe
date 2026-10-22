@@ -19,6 +19,7 @@ from .cache import load_cached, save_cached
 from .security import redact_secrets
 from .mcp_ingest import extract_mcp_config, is_mcp_config_path
 from .manifest_ingest import extract_package_manifest, is_package_manifest_path
+from .rust_paths import resolve_path_calls as resolve_rust_path_calls
 from .rust_paths import retarget_use_edges as retarget_rust_use_edges
 from .resolver_registry import (
     LanguageResolver,
@@ -10594,6 +10595,10 @@ def extract(
         # and collides with any top-level function named "log" in the corpus.
         if rc.get("is_member_call"):
             continue
+        # A Rust path call (`crate::a::f()`) names its item: resolve_rust_path_calls
+        # binds it by the path, never here by its last segment (#908).
+        if rc.get("rust_path"):
+            continue
         # Skip Ruby include/extend/prepend mixin markers: they carry a module
         # name as `callee` but are not calls — the Ruby resolver turns them into
         # `mixes_in` edges. Letting the shared pass emit a `calls` edge here would
@@ -10970,6 +10975,13 @@ def extract(
     # results: raw_calls come solely from `paths`, so nothing sourced by an
     # unchanged file is ever emitted, and the ambiguity guards count the same
     # candidates a full build would (the context is the whole unchanged corpus).
+    try:
+        all_edges.extend(resolve_rust_path_calls(
+            all_raw_calls, resolution_nodes, all_edges + list(resolution_context_edges or []), root,
+        ))
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Rust path-call resolution failed, skipping: %s", exc)
     _stamp_python_fixture_paths(per_file, root)
     if resolution_context_nodes or resolution_context_edges:
         _rl_nodes = list(resolution_nodes)
