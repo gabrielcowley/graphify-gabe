@@ -67,7 +67,9 @@ _WORKSPACE = {
         "        ExpectError::Over(n) => Ok(*n + crate::expect::LIMIT + ExpectError::CAP + ExpectError::FLOOR),\n"
         "    }\n}\n\n"
         "pub fn elsewhere(e: &ExpectError) -> u32 {\n    assert!(matches!(e, ExpectError::BattleNotStated));\n"
-        "    let _ = (u32::MAX, std::u32::MAX, Ordering::Less, UNDEFINED_NAME);\n    LIMIT\n}\n"
+        "    let _ = (u32::MAX, std::u32::MAX, Ordering::Less, UNDEFINED_NAME);\n    LIMIT\n}\n\n"
+        # A function's own `const` shadows the module's: neither its name nor its use is LIMIT's.
+        "pub fn shadowed() -> u32 {\n    const LIMIT: u32 = 2;\n    LIMIT\n}\n"
     ),
     # A same-named Python module beside the crate is never a Rust path's target.
     "util.py": "def helper():\n    pass\n",
@@ -228,6 +230,7 @@ def test_a_bare_constant_resolves_through_its_use(workspace):
     limit = _nid(workspace, "LIMIT", "a/src/expect.rs")
     assert _references_from(workspace, "elsewhere()", "a/src/values.rs") == [(limit, "const", "EXTRACTED")]
     assert (limit, "const", "EXTRACTED") in _references_from(workspace, "check()", "a/src/other.rs")
+    assert _references_from(workspace, "shadowed()", "a/src/values.rs") == []
     # Not `matches!(…)`'s variant (a macro's arguments are not parsed), nor std's or
     # an undefined name's constants.
 
