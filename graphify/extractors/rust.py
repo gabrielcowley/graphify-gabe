@@ -279,17 +279,31 @@ def _rust_path_may_be_local(segments: tuple[str, ...], local_types: set[str]) ->
 _RUST_CONST_NAME = re.compile(r"[A-Z][A-Z0-9_]*[A-Z0-9][A-Z0-9_]*")
 
 # Where an identifier or a path is not a reference of its own: part of a longer
-# path, a macro's name or token tree, a generic call's function, or a binding.
+# path, a macro's name or token tree, a generic call's function, a binding, or
+# a declaration in a function body (a local enum's variant, a const generic).
 _RUST_NOT_A_REFERENCE_PARENTS = frozenset({
     "scoped_identifier", "scoped_type_identifier", "macro_invocation", "token_tree",
     "generic_function", "let_declaration", "parameter", "closure_parameters",
-    "shorthand_field_initializer",
+    "shorthand_field_initializer", "enum_variant", "const_parameter",
 })
 
 _RUST_PATTERN_NODES = frozenset({
     "tuple_struct_pattern", "tuple_pattern", "or_pattern", "slice_pattern", "reference_pattern",
     "ref_pattern", "captured_pattern", "struct_pattern", "mut_pattern", "range_pattern",
 })
+
+
+def _rust_local_consts(body, source: bytes) -> set[str]:
+    """The `const` and `static` names a function body declares, nested blocks
+    included and nested functions not: none of them is a graph node."""
+    names: set[str] = set()
+    stack = [body]
+    while stack:
+        node = stack.pop()
+        if node.type in ("const_item", "static_item") and (name := node.child_by_field_name("name")) is not None:
+            names.add(_read_text(name, source))
+        stack.extend(child for child in node.children if child.type != "function_item")
+    return names
 
 
 def _rust_in_pattern(node) -> bool:
@@ -997,6 +1011,8 @@ def extract_rust(path: Path) -> dict:
             return None  # `crate::`, a `use`d name, a file module or another crate
         return in_file_items.get("::".join(base + rest)) if rest else None
 
+    local_consts: dict[str, set[str]] = {}
+
     def reference(node, caller_nid: str, self_type: str | None, scope: tuple[str, ...]) -> None:
         # A variant or constant named as a value or in a pattern: `Err(E::Missing)`,
         # `E::Missing =>`, `LIMIT`, `crate::config::LIMIT`, `Type::CONST`. The
@@ -1006,10 +1022,12 @@ def extract_rust(path: Path) -> dict:
             return
         if parent.type == "call_expression" and parent.child_by_field_name("function") == node:
             return
+        if parent.type in ("const_item", "static_item") and parent.child_by_field_name("name") == node:
+            return  # a constant's own name, declared in a function body
         if node.type == "identifier":
             name = _read_text(node, source)
-            if not _RUST_CONST_NAME.fullmatch(name):
-                return
+            if not _RUST_CONST_NAME.fullmatch(name) or name in local_consts.get(caller_nid, ()):
+                return  # a function's own `const` shadows any outside it
             segments: tuple[str, ...] | None = (name,)
         else:
             segments = _rust_call_path(node, source)
@@ -1198,6 +1216,8 @@ def extract_rust(path: Path) -> dict:
         for child in node.children:
             walk_calls(child, caller_nid, self_type, self_impl_key, scope)
 
+    for caller_nid, body_node, impl_type, impl_key, body_scope in function_bodies:
+        local_consts.setdefault(caller_nid, set()).update(_rust_local_consts(body_node, source))
     for caller_nid, body_node, impl_type, impl_key, body_scope in function_bodies:
         walk_calls(body_node, caller_nid, impl_type, impl_key, body_scope)
 
