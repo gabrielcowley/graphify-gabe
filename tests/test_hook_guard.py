@@ -574,6 +574,37 @@ def test_a_malformed_index_is_rebuilt(index_text, tmp_path, monkeypatch):
     assert "- load_config() (src/app.py L10)" in ctx
 
 
+def test_a_build_writes_the_index_its_hints_read(tmp_path, monkeypatch):
+    # The graph is written by the build, not by a test: no hint has to parse it.
+    import networkx as nx
+    from graphify import cli, hint_index
+    from graphify.export import to_json
+    G = nx.Graph()
+    G.add_node("a", label="load_config()", source_file="src/app.py", source_location="L10")
+    graph = tmp_path / "graphify-out" / "graph.json"
+    graph.parent.mkdir()
+    assert to_json(G, {0: ["a"]}, str(graph), force=True)
+    assert hint_index.read(graph) == [{"label": "load_config()", "source_file": "src/app.py", "source_location": "L10"}]
+    monkeypatch.setattr(cli, "_HINT_GRAPH_MAX_BYTES", 10)
+    out = _invoke("search", {"tool_input": {"pattern": "load_config"}}, tmp_path, monkeypatch, graph=False)
+    assert "- load_config() (src/app.py L10)" in _ctx(out)
+
+
+def test_a_watch_rebuild_writes_the_index(tmp_path, monkeypatch):
+    from graphify import hint_index
+    from graphify.watch import _rebuild_code
+    (tmp_path / "app.py").write_text("def load_config():\n    pass\n", encoding="utf-8")
+    assert _rebuild_code(tmp_path, no_cluster=True, acquire_lock=False) is True
+    labels = {n["label"] for n in hint_index.read(tmp_path / "graphify-out" / "graph.json") or []}
+    assert "load_config()" in labels
+    # An incremental rebuild that changes the graph re-stamps the index.
+    (tmp_path / "app.py").write_text("def load_config():\n    pass\n\n\ndef save_config():\n    pass\n",
+                                     encoding="utf-8")
+    assert _rebuild_code(tmp_path, changed_paths=[tmp_path / "app.py"], no_cluster=True, acquire_lock=False) is True
+    labels = {n["label"] for n in hint_index.read(tmp_path / "graphify-out" / "graph.json") or []}
+    assert "save_config()" in labels
+
+
 def test_search_nudge_without_exact_label_suggests_query(tmp_path, monkeypatch):
     ctx = _ctx(_invoke_with_graph("search", {"tool_input": {"pattern": "config"}}, tmp_path, monkeypatch))
     assert 'Start with: `graphify query "config"`' in ctx
