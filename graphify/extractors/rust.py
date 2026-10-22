@@ -49,10 +49,11 @@ def _rust_collect_type_refs(
     node,
     source: bytes,
     generic: bool,
-    out: list[tuple[str, str]],
+    out: list[tuple[str, str, str]],
     local_types: frozenset[str] = frozenset(),
 ) -> None:
-    """Walk a Rust type expression; append (name, role) tuples.
+    """Walk a Rust type expression; append (name, role, path) tuples: the path is
+    the type as written (`crate::a::Flow`), the name its last segment.
 
     A name in ``_RUST_BUILTIN_TYPES`` is skipped unless ``local_types`` holds it:
     a file that defines its own ``struct Result<T>`` shadows the prelude, and its
@@ -71,12 +72,13 @@ def _rust_collect_type_refs(
     if t == "type_identifier":
         text = _read_text(node, source)
         if _keep(text):
-            out.append((text, "generic_arg" if generic else "type"))
+            out.append((text, "generic_arg" if generic else "type", text))
         return
     if t == "scoped_type_identifier":
-        text = _read_text(node, source).rsplit("::", 1)[-1]
+        path = "".join(_read_text(node, source).split())
+        text = path.rsplit("::", 1)[-1]
         if _keep(text):
-            out.append((text, "generic_arg" if generic else "type"))
+            out.append((text, "generic_arg" if generic else "type", path))
         return
     if t == "generic_type":
         name_node = node.child_by_field_name("type")
@@ -86,9 +88,10 @@ def _rust_collect_type_refs(
                     name_node = c
                     break
         if name_node is not None:
-            text = _read_text(name_node, source).rsplit("::", 1)[-1]
+            path = "".join(_read_text(name_node, source).split())
+            text = path.rsplit("::", 1)[-1]
             if _keep(text):
-                out.append((text, "generic_arg" if generic else "type"))
+                out.append((text, "generic_arg" if generic else "type", path))
         for c in node.children:
             if c.type == "type_arguments":
                 for arg in c.children:
@@ -478,9 +481,9 @@ def extract_rust(path: Path) -> dict:
             type_node = node.child_by_field_name("type")
             if type_node is not None:
                 type_name = _read_text(type_node, source).strip()
-                refs: list[tuple[str, str]] = []
+                refs: list[tuple[str, str, str]] = []
                 _rust_collect_type_refs(type_node, source, False, refs)
-                bare = next((ref for ref, role in refs if role == "type"), type_name)
+                bare = next((ref for ref, role, _path in refs if role == "type"), type_name)
                 items_by_id.setdefault(_make_id(stem, type_name), set()).add((True, bare))
                 impl_bare_names[node.start_byte] = bare
             return
@@ -541,6 +544,21 @@ def extract_rust(path: Path) -> dict:
             })
         return nid
 
+    def add_type_ref(src_nid: str, ref: tuple[str, str, str], line: int, relation: str = "references",
+                     context: str | None = None) -> None:
+        """An edge from ``src_nid`` to the type ``ref`` names. A type this file does
+        not declare gets a sourceless stub, and the edge its path and module
+        scope, for rust_paths.retarget_path_edges to resolve."""
+        ref_name, _role, ref_path = ref
+        tgt = ensure_named_node(ref_name, line)
+        if tgt == src_nid:
+            return
+        add_edge(src_nid, tgt, relation, line, context=context)
+        if tgt == _make_id(ref_name):
+            edges[-1]["_rust_type_path"] = ref_path
+            if mod_scope:
+                edges[-1]["_rust_use_scope"] = "::".join(mod_scope)
+
     def emit_param_return_refs(func_node, func_nid: str, line: int) -> None:
         params = func_node.child_by_field_name("parameters")
         if params is not None:
@@ -548,22 +566,17 @@ def extract_rust(path: Path) -> dict:
                 if p.type != "parameter":
                     continue
                 type_node = p.child_by_field_name("type")
-                refs: list[tuple[str, str]] = []
+                refs: list[tuple[str, str, str]] = []
                 _rust_collect_type_refs(type_node, source, False, refs, local_type_names)
-                for ref_name, role in refs:
-                    ctx = "generic_arg" if role == "generic_arg" else "parameter_type"
-                    tgt = ensure_named_node(ref_name, line)
-                    if tgt != func_nid:
-                        add_edge(func_nid, tgt, "references", line, context=ctx)
+                for ref in refs:
+                    add_type_ref(func_nid, ref, line,
+                                 context="generic_arg" if ref[1] == "generic_arg" else "parameter_type")
         return_type = func_node.child_by_field_name("return_type")
         if return_type is not None:
             refs = []
             _rust_collect_type_refs(return_type, source, False, refs, local_type_names)
-            for ref_name, role in refs:
-                ctx = "generic_arg" if role == "generic_arg" else "return_type"
-                tgt = ensure_named_node(ref_name, line)
-                if tgt != func_nid:
-                    add_edge(func_nid, tgt, "references", line, context=ctx)
+            for ref in refs:
+                add_type_ref(func_nid, ref, line, context="generic_arg" if ref[1] == "generic_arg" else "return_type")
 
     def walk(
         node,
@@ -661,18 +674,13 @@ def extract_rust(path: Path) -> dict:
                         for sub in c.children:
                             if not sub.is_named:
                                 continue
-                            refs: list[tuple[str, str]] = []
+                            refs: list[tuple[str, str, str]] = []
                             _rust_collect_type_refs(sub, source, False, refs, local_type_names)
-                            for idx, (ref_name, _role) in enumerate(refs):
-                                tgt = ensure_named_node(ref_name, line)
-                                if tgt == item_nid:
-                                    continue
-                                rel = "inherits" if idx == 0 else "references"
-                                if rel == "inherits":
-                                    add_edge(item_nid, tgt, "inherits", line)
+                            for idx, ref in enumerate(refs):
+                                if idx == 0:
+                                    add_type_ref(item_nid, ref, line, "inherits")
                                 else:
-                                    add_edge(item_nid, tgt, "references", line,
-                                             context="generic_arg")
+                                    add_type_ref(item_nid, ref, line, context="generic_arg")
                 if t == "struct_item":
                     for c in node.children:
                         if c.type != "field_declaration_list":
@@ -690,12 +698,9 @@ def extract_rust(path: Path) -> dict:
                                         break
                             refs = []
                             _rust_collect_type_refs(type_node, source, False, refs, local_type_names)
-                            for ref_name, role in refs:
-                                ctx = "generic_arg" if role == "generic_arg" else "field"
-                                tgt = ensure_named_node(ref_name, field.start_point[0] + 1)
-                                if tgt != item_nid:
-                                    add_edge(item_nid, tgt, "references",
-                                             field.start_point[0] + 1, context=ctx)
+                            for ref in refs:
+                                add_type_ref(item_nid, ref, field.start_point[0] + 1,
+                                             context="generic_arg" if ref[1] == "generic_arg" else "field")
                     # Tuple structs (`struct Wrapper(pub Logger, Config);`) nest their
                     # positional field types directly under ordered_field_declaration_list
                     # with no field_declaration wrapper -- the same shape handled for tuple
@@ -712,11 +717,9 @@ def extract_rust(path: Path) -> dict:
                                 continue
                             refs = []
                             _rust_collect_type_refs(tc, source, False, refs, local_type_names)
-                            for ref_name, role in refs:
-                                ctx = "generic_arg" if role == "generic_arg" else "field"
-                                tgt = ensure_named_node(ref_name, fline)
-                                if tgt != item_nid:
-                                    add_edge(item_nid, tgt, "references", fline, context=ctx)
+                            for ref in refs:
+                                add_type_ref(item_nid, ref, fline,
+                                             context="generic_arg" if ref[1] == "generic_arg" else "field")
                 if t == "enum_item":
                     # Variant payload types nest under enum_variant_list ->
                     # enum_variant -> ordered_field_declaration_list (tuple variant,
@@ -730,13 +733,11 @@ def extract_rust(path: Path) -> dict:
                     def _emit_enum_type(type_node, at_line):
                         if type_node is None:
                             return
-                        refs2: list[tuple[str, str]] = []
+                        refs2: list[tuple[str, str, str]] = []
                         _rust_collect_type_refs(type_node, source, False, refs2, local_type_names)
-                        for ref_name, role in refs2:
-                            ctx = "generic_arg" if role == "generic_arg" else "field"
-                            tgt = ensure_named_node(ref_name, at_line)
-                            if tgt != item_nid:
-                                add_edge(item_nid, tgt, "references", at_line, context=ctx)
+                        for ref in refs2:
+                            add_type_ref(item_nid, ref, at_line,
+                                         context="generic_arg" if ref[1] == "generic_arg" else "field")
 
                     for c in node.children:
                         if c.type != "enum_variant_list":
@@ -811,14 +812,10 @@ def extract_rust(path: Path) -> dict:
                     mark_item_path(item_nid, item_name)
                 type_node = node.child_by_field_name("type")
                 if type_node is not None:
-                    refs: list[tuple[str, str]] = []
+                    refs: list[tuple[str, str, str]] = []
                     _rust_collect_type_refs(type_node, source, False, refs, local_type_names)
-                    for ref_name, role in refs:
-                        tgt = ensure_named_node(ref_name, line)
-                        if tgt == item_nid:
-                            continue
-                        ctx = "generic_arg" if role == "generic_arg" else "field"
-                        add_edge(item_nid, tgt, "references", line, context=ctx)
+                    for ref in refs:
+                        add_type_ref(item_nid, ref, line, context="generic_arg" if ref[1] == "generic_arg" else "field")
             return
 
         if t == "impl_item":
@@ -839,17 +836,13 @@ def extract_rust(path: Path) -> dict:
                 # `self` as `Foo`, not the literal `Foo<T>` text.
                 impl_type_bare = type_name.split("<")[0].strip()
             if trait_node is not None and impl_nid is not None:
-                refs: list[tuple[str, str]] = []
+                refs: list[tuple[str, str, str]] = []
                 _rust_collect_type_refs(trait_node, source, False, refs, local_type_names)
-                for idx, (ref_name, _role) in enumerate(refs):
-                    tgt = ensure_named_node(ref_name, node.start_point[0] + 1)
-                    if tgt == impl_nid:
-                        continue
+                for idx, ref in enumerate(refs):
                     if idx == 0:
-                        add_edge(impl_nid, tgt, "implements", node.start_point[0] + 1)
+                        add_type_ref(impl_nid, ref, node.start_point[0] + 1, "implements")
                     else:
-                        add_edge(impl_nid, tgt, "references", node.start_point[0] + 1,
-                                 context="generic_arg")
+                        add_type_ref(impl_nid, ref, node.start_point[0] + 1, context="generic_arg")
             body = node.child_by_field_name("body")
             if body:
                 has_methods = any(

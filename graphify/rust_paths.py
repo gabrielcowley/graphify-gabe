@@ -228,8 +228,9 @@ class RustPathIndex:
         return found
 
 
-def retarget_use_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> None:
-    """Point each Rust `use` edge at what its path names, when that is exactly one thing.
+def retarget_path_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> set[str]:
+    """Point each Rust `use` edge, and each reference to a type another file
+    declares, at what its path names, when that is exactly one thing.
 
     An item takes the edge, and marks it `_rust_use_evidence = "symbol"`: the
     shared call pass counts it as an import of that symbol. A module that is a
@@ -239,11 +240,29 @@ def retarget_use_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> 
     drops `_rust_use_name`, so #4439's by-name rewire only sees the rest. A `use`
     of the file it is written in (`use super::*;` in the file's inline
     `mod tests`) says nothing, and is dropped rather than left on a `super` stub.
+
+    A type reference (a parameter, field, return or generic argument type, a
+    supertrait, an implemented trait) carries `_rust_type_path`, the type as
+    written: `Flow` resolves through the module's own items and its `use`s, as
+    `crate::battle::Flow` does through the module tree. It lands only on a
+    struct, enum or trait declaration, so a name two files declare is no longer
+    left on a sourceless stub when the path says which one it is. Returns the
+    stubs this leaves with no edge, for the caller to drop.
     """
+    nodes = list(nodes)
     pending = [e for e in edges if e.get("_rust_use_path")]
-    if not pending:
-        return
+    typed = [e for e in edges if e.get("_rust_type_path")]
+    if not pending and not typed:
+        return set()
     index = RustPathIndex(nodes, root)
+    declarations = {n["id"] for n in nodes if n.get("_rust_declaration_count")}
+    left: set[str] = set()
+    for edge in typed:
+        target = index.resolve(str(edge.get("source_file", "")), str(edge.get("_rust_use_scope", "")),
+                               str(edge["_rust_type_path"]), root)
+        if target is not None and target[0] == "item" and target[1] in declarations:
+            left.add(edge["target"])
+            edge["target"] = str(target[1])
     own_file: set[int] = set()
     for edge in pending:
         path = str(edge["_rust_use_path"])
@@ -267,6 +286,7 @@ def retarget_use_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> 
         edge.pop("_rust_use_name", None)
     if own_file:
         edges[:] = [e for e in edges if id(e) not in own_file]
+    return left - {end for e in edges for end in (e.get("source"), e.get("target"))}
 
 
 def resolve_path_calls(
