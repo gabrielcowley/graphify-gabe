@@ -50,9 +50,9 @@ _WORKSPACE = {
     "a/src/renamed.rs": "pub fn relocated() {}\n",
     "a/src/other.rs": (
         "use crate::expect::{ExpectError, LIMIT};\nuse crate::moved::relocated;\n"
-        "use crate::rng::draws_between;\nuse std::fs::read;\nuse serde::Serialize;\n\n"
+        "use crate::rng::draws_between;\nuse std::fs;\nuse std::fs::read;\nuse serde::Serialize;\n\n"
         "pub fn check() -> u32 {\n    relocated();\n    draws_between(0, LIMIT)\n}\n\n"
-        "pub fn paths(name: &str) -> bool {\n    let _ = std::fs::read(name);\n    let _ = Vec::<u8>::new();\n"
+        "pub fn paths(name: &str) -> bool {\n    let _ = std::fs::read(name);\n    let _ = fs::read(name);\n    let _ = Vec::<u8>::new();\n"
         "    let _ = util::helper();\n    let _ = ExpectError::exceeded(1);\n    let _ = crate::expect::ExpectError::Over(2);\n"
         "    crate::fixture::is_fixture_file(name) && super::fixture::is_fixture_file(name)\n}\n"
     ),
@@ -180,7 +180,8 @@ def test_a_type_qualified_call_binds_to_the_types_method_or_variant(workspace):
 
 def test_a_path_into_another_crate_or_language_binds_nothing(workspace):
     targets = {target for target, _, _ in _calls_from(workspace, "paths()", "a/src/other.rs")}
-    assert _nid(workspace, "read()", "a/src/fs.rs") not in targets  # std::fs::read
+    # `std::fs::read()`, and `fs::read()` after `use std::fs;`, beside the crate's own fs.rs.
+    assert _nid(workspace, "read()", "a/src/fs.rs") not in targets
     assert _nid(workspace, "helper()", "util.py") not in targets
     assert len(targets) == 3  # is_fixture_file, .exceeded() and Over
 
