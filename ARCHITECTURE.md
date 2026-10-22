@@ -137,3 +137,16 @@ When normal ID normalization removes an entire binding name, its UTF-8 bytes
 provide a deterministic operator suffix within the same lexical owner. Its double
 underscore separators cannot collide with an ordinary normalized binding ID. Local
 call resolution stops if malformed scope metadata cycles.
+
+A Rust `use` lands on what its path names, not on whatever shares its last
+segment. `graphify/rust_paths.py` rebuilds each crate's module tree from the
+nodes: crate names from `Cargo.toml` package nodes, roots from Cargo's default
+layout, `mod x;` (and `#[path]`) to `x.rs` or `x/mod.rs`, and `pub use`
+re-exports up to four hops. The extractor leaves what it needs as node markers
+(`_rust_paths`, `_rust_mods`, `_rust_inline_mods`, `_rust_imports`), which
+incremental builds forward like the other resolver markers. A path that names
+exactly one item takes the edge and counts as an import of that symbol for the
+call pass; a glob of a file module counts as an import of that file; a plain
+module import is no evidence for a bare call. Anything else (another crate, a
+glob re-export, two candidates) keeps the bare-name target and #4439's fallback.
+AST cache schema 23 retires cached Rust results that lack the markers.

@@ -19,6 +19,7 @@ from .cache import load_cached, save_cached
 from .security import redact_secrets
 from .mcp_ingest import extract_mcp_config, is_mcp_config_path
 from .manifest_ingest import extract_package_manifest, is_package_manifest_path
+from .rust_paths import retarget_use_edges as retarget_rust_use_edges
 from .resolver_registry import (
     LanguageResolver,
     register as register_language_resolver,
@@ -10300,6 +10301,17 @@ def extract(
     # An incremental build re-extracts only the changed files, so the rewire also
     # needs the unchanged ones as candidates, or it resolves less than a full build.
     _fresh_ids = {n.get("id") for n in all_nodes}
+    # A Rust `use` whose path names exactly one item, through the crate's module
+    # tree, lands on that item whatever its name (graphify/rust_paths.py). The
+    # lent stubs below only serve the imports it leaves.
+    try:
+        retarget_rust_use_edges(
+            all_nodes + [n for n in resolution_context_nodes or [] if n.get("id") not in _fresh_ids],
+            all_edges, root,
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Rust use-path resolution failed, skipping: %s", exc)
     # #4439: a Rust `use` reached its declaration only when a type annotation had left
     # a sourceless node under the same id. Lend the rewire one for each imported name
     # that has none; they are not kept, so an unresolved import dangles as before.
@@ -10474,10 +10486,22 @@ def extract(
     # confirm the caller pulled in the callee's source file.
     file_to_symbol_imports: dict[str, set[str]] = {}
     file_to_module_imports: dict[str, set[str]] = {}
+    # The files a Rust `use path::*;` globs: unlike a module import, a glob
+    # brings each of the file's names into scope, so it is evidence for the one
+    # a bare call names (#2945 keeps a plain module import from being).
+    file_to_glob_imports: dict[str, set[str]] = {}
     for e in all_edges:
-        if e.get("relation") == "imports":
+        # A Rust `use` resolved by its path says what it brings into scope: one
+        # item, a glob of a file's names, or (a plain module import) nothing a
+        # bare call can reach (rust_paths.retarget_use_edges).
+        rust_evidence = e.get("_rust_use_evidence")
+        if rust_evidence == "module":
+            file_to_glob_imports.setdefault(e["source"], set()).add(e["target"])
+        if e.get("relation") == "imports" or rust_evidence == "symbol":
             file_to_symbol_imports.setdefault(e["source"], set()).add(e["target"])
-        elif e.get("relation") == "imports_from" and not e.get("_rust_use_binding"):
+        elif rust_evidence == "module" or (
+            rust_evidence is None and e.get("relation") == "imports_from" and not e.get("_rust_use_binding")
+        ):
             file_to_module_imports.setdefault(e["source"], set()).add(e["target"])
 
     # Map each node back to its containing file node id so we can ask
@@ -10716,6 +10740,7 @@ def extract(
         )
         imported_symbols = file_to_symbol_imports.get(caller_file_nid, set())
         imported_modules = file_to_module_imports.get(caller_file_nid, set())
+        globbed_files = file_to_glob_imports.get(caller_file_nid, set())
 
         def _has_import_evidence(candidate_id: str) -> bool:
             # Direct symbol import (`import { foo }`) is the strongest evidence:
@@ -10780,7 +10805,8 @@ def extract(
                     # the callee's source file, not that it imported this specific
                     # symbol. Promoting to EXTRACTED here falsely certifies a
                     # same-named symbol that was never actually imported (#2945).
-                    has_import_evidence = False
+                    # A Rust glob is the exception: it imports every name.
+                    has_import_evidence = nid_to_file_nid.get(tgt) in globbed_files
                 else:
                     # No unique import evidence. Instead of dropping the edge
                     # outright (which let a single same-named test mock erase the
@@ -10960,6 +10986,9 @@ def extract(
     for e in all_edges:
         e.pop("_rust_use_binding", None)
         e.pop("_rust_use_name", None)
+        e.pop("_rust_use_path", None)
+        e.pop("_rust_use_scope", None)
+        e.pop("_rust_use_evidence", None)
 
     # Relativize source_file fields so paths are portable across machines (#555).
     # When the node's id was itself minted from the absolute path, remap it to a
