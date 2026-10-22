@@ -147,5 +147,9 @@ A path call resolves the same way: `crate::fixture::f()`, `super::f()` and
 `a::rng::f()` bind to the item the path names, and `Type::f()` to the one
 method of that type across its impl blocks, all EXTRACTED. A path call never
 reaches the bare-name cross-file pass (#908), and in its own file it binds only
-where the path leads, not to any same-named item there. AST cache schemas 21
-and 22 retire cached Rust results that lack the markers.
+where the path leads, not to any same-named item there. A variant or constant
+named as a value or in a pattern (`Err(E::Missing)`, `E::Missing =>`, `LIMIT`,
+`Type::CONST`) is a `references` edge with context `variant`, `const` or
+`match`, resolved the same way and only ever to a data item. A macro's
+arguments are an unparsed token tree, so `matches!(e, E::Missing)` gets none.
+AST cache schemas 21 to 23 retire cached Rust results that lack the markers.
