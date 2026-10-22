@@ -2307,6 +2307,8 @@ def _rebuild_code(
                 graph_tmp = out / ".graph.tmp.json"
                 graph_tmp.write_text(candidate_graph_text, encoding="utf-8")
                 os_replace_with_fallback(graph_tmp, existing_graph)
+                from graphify.hint_index import publish as _publish_hint_index
+                _publish_hint_index(existing_graph, candidate_graph_data.get("nodes"))
 
             # Write the scan root only after the candidate graph is accepted,
             # so a refused shrink cannot mismatch graph and marker. See
@@ -2583,6 +2585,8 @@ def _rebuild_code(
             # destination read earlier in the same process raises
             # PermissionError even on the same drive.
             os_replace_with_fallback(graph_tmp, existing_graph)
+            from graphify.hint_index import publish as _publish_hint_index
+            _publish_hint_index(existing_graph, candidate_graph_data.get("nodes"))
             write_text_atomic(report_path, report)
             # Keep the membership signatures in step with the labels we just wrote.
             # Skipping this was the other half of the stale-label bug: labels.json
