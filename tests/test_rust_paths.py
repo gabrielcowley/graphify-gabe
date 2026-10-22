@@ -202,6 +202,22 @@ def test_a_type_qualified_call_binds_to_the_types_method_or_variant(workspace):
     assert (_nid(workspace, "Over", "a/src/expect.rs"), "references", "EXTRACTED") in calls
 
 
+def test_a_turbofish_call_binds_like_the_plain_one(tmp_path: Path):
+    result = _extract(tmp_path, {
+        "Cargo.toml": '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": "pub mod parse;\npub mod user;\n",
+        "src/parse.rs": "pub fn parse_num<T: Default>() -> T {\n    T::default()\n}\n",
+        "src/user.rs": (
+            "use crate::parse::parse_num;\n\npub fn by_use() -> u32 {\n    parse_num::<u32>()\n}\n\n"
+            "pub fn by_path() -> u8 {\n    crate::parse::parse_num::<u8>()\n}\n\n"
+            "fn local<T>() {}\n\npub fn in_file() {\n    local::<u8>();\n}\n"
+        )})
+    read = _nid(result, "parse_num()", "src/parse.rs")
+    assert _calls_from(result, "by_use()", "src/user.rs") == [(read, "calls", "EXTRACTED")]
+    assert _calls_from(result, "by_path()", "src/user.rs") == [(read, "calls", "EXTRACTED")]
+    assert _calls_from(result, "in_file()", "src/user.rs") == [(_nid(result, "local()", "src/user.rs"), "calls", "EXTRACTED")]
+
+
 def test_a_path_into_another_crate_or_language_binds_nothing(workspace):
     targets = {target for target, _, _ in _calls_from(workspace, "paths()", "a/src/other.rs")}
     # `std::fs::read()`, and `fs::read()` after `use std::fs;`, beside the crate's own fs.rs.

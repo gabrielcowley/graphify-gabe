@@ -1003,6 +1003,10 @@ def extract_rust(path: Path) -> dict:
             # nor drops any nested edges relative to before).
         if node.type == "call_expression":
             func_node = node.child_by_field_name("function")
+            if func_node is not None and func_node.type == "generic_function":
+                # `f::<T>()`, `a::f::<T>()`, `x.collect::<T>()`: the call of what is
+                # named before the turbofish.
+                func_node = func_node.child_by_field_name("function")
             callee_name: str | None = None
             is_member_call: bool = False
             is_scoped_call: bool = False
