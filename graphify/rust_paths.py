@@ -19,9 +19,10 @@ through `mod x;` declarations to `x.rs` or `x/mod.rs` (a `#[path]` wins), so a
 file reached from no root has no module and resolves nothing.
 
 Resolution fails closed: a path resolves only when it names exactly one item or
-module. `std::`, `serde::`, any crate outside the corpus, a glob, a `[lib]` or
-dependency rename, and a name reached only through a glob re-export resolve to
-nothing; `pub use` chains are followed at most `_MAX_HOPS` deep.
+module. `std::`, `serde::`, any crate outside the corpus, and a `[lib]` or
+dependency rename resolve to nothing. `use` and `pub use` chains, globs
+included (a name a module declares or imports by name shadows a glob's), are
+followed at most `_MAX_HOPS` deep.
 """
 from __future__ import annotations
 
@@ -89,6 +90,17 @@ class RustPathIndex:
             libs = {f"{d}/src/lib.rs" for d in dirs} & self._files.keys()
             if len(dirs) == 1 and len(libs) == 1:
                 self._crate_libs[crate_name] = libs.pop()
+
+        # Each module's `use` bindings, by the name they bind, and its globs.
+        self._imports: dict[tuple[str, tuple[str, ...]], tuple[dict[str, list[tuple[str, ...]]], list[tuple[str, ...]]]] = {}
+        for file, info in self._files.items():
+            for scope, bound, use_path, _is_pub in info.get("_rust_imports") or ():
+                by_name, globs = self._imports.setdefault((file, _split(scope)), ({}, []))
+                if use_path.endswith("*"):
+                    if _split(use_path)[:-1]:
+                        globs.append(_split(use_path)[:-1])
+                else:
+                    by_name.setdefault(bound, []).append(_split(use_path))
 
         self._modules: dict[ModKey, tuple[str, tuple[str, ...]]] = {}
         self._file_modules: dict[str, set[ModKey]] = {}
@@ -203,10 +215,15 @@ class RustPathIndex:
         found |= {("item", nid) for nid in self._items.get((file, "::".join(inline + (name,))), ())}
         if hops > 0:
             # A `use` binds the name in its module; `pub use` re-exports it.
-            info = self._files[file]
-            for scope, bound, use_path, _is_pub in info.get("_rust_imports") or ():
-                if bound == name and _split(scope) == inline and not use_path.endswith("*"):
-                    found |= self._walk((root_file, module), _split(use_path), hops - 1)
+            by_name, globs = self._imports.get((file, inline), ({}, []))
+            for segments in by_name.get(name, ()):
+                found |= self._walk((root_file, module), segments, hops - 1)
+            # A glob (`use super::*;`) brings in every name of what it imports, but
+            # anything the module declares or imports by name shadows it.
+            if not found:
+                for segments in globs:
+                    for source in self._walk((root_file, module), segments, hops - 1):
+                        found |= self._member(source, name, hops - 1)
         return found
 
 
@@ -243,3 +260,74 @@ def retarget_use_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> 
         edge["target"] = new_target
         edge["_rust_use_evidence"] = evidence
         edge.pop("_rust_use_name", None)
+
+
+def resolve_path_calls(
+    raw_calls: Iterable[dict], nodes: list[dict], edges: list[dict], root: Path,
+) -> list[dict]:
+    """`calls` edges for the Rust path calls (`rust_path` raw calls) the path names.
+
+    The whole path is tried first: `crate::fixture::is_fixture_file`,
+    `super::f`, `a::rng::draws_between`, or a variant constructor
+    (`ExpectError::Missing(x)`, a `references` edge). Failing that, all but the
+    last segment must name a type and the last one of its methods: the type's
+    impl blocks are pooled across files the way `_resolve_rust_self_member_calls`
+    pools them, and only when one declaration has that name; with several, only
+    the impl blocks sharing the declaration's node count. Exactly one target or
+    no edge, and every edge is EXTRACTED: the path says which item it is.
+    """
+    pending = [rc for rc in raw_calls if rc.get("rust_path") and rc.get("caller_nid")]
+    if not pending:
+        return []
+    index = RustPathIndex(nodes, root)
+    node_by_id = {n.get("id"): n for n in nodes}
+    methods: dict[tuple[str, str], set[str]] = {}
+    for e in edges:
+        if e.get("relation") == "method" and (target := node_by_id.get(e.get("target"))) is not None:
+            methods.setdefault((str(e.get("source")), str(target.get("label", "")).strip("()").lstrip(".")),
+                               set()).add(e["target"])
+    owners_by_label: dict[str, list[str]] = {}
+    declarations: dict[str, int] = {}
+    for n in nodes:
+        if not str(n.get("source_file") or "").endswith(".rs"):
+            continue
+        label = str(n.get("label", ""))
+        impl_key = n.get("_rust_impl_key")
+        owner = impl_key.rsplit("/", 1)[0] if isinstance(impl_key, str) and "/" in impl_key else label
+        owners_by_label.setdefault(owner, []).append(n["id"])
+        if isinstance(count := n.get("_rust_declaration_count"), int) and not isinstance(count, bool):
+            declarations[label] = declarations.get(label, 0) + count
+
+    def method_of(type_nid: str, name: str) -> str | None:
+        label = str(node_by_id.get(type_nid, {}).get("label", ""))
+        owners = owners_by_label.get(label, []) if declarations.get(label) == 1 else [type_nid]
+        found = {m for owner in owners for m in methods.get((owner, name), ())}
+        return next(iter(found)) if len(found) == 1 else None
+
+    existing = {(e.get("source"), e.get("target")) for e in edges if e.get("relation") in ("calls", "references")}
+    new_edges: list[dict] = []
+    for rc in pending:
+        source_file, scope, path = str(rc.get("source_file", "")), str(rc.get("rust_scope", "")), str(rc["rust_path"])
+        target = index.resolve(source_file, scope, path, root)
+        tgt = str(target[1]) if target is not None and target[0] == "item" else None
+        if tgt is None and "::" in path:
+            owner = index.resolve(source_file, scope, path.rsplit("::", 1)[0], root)
+            if owner is not None and owner[0] == "item":
+                tgt = method_of(str(owner[1]), path.rsplit("::", 1)[1])
+        caller = rc["caller_nid"]
+        if tgt is None or tgt == caller or (caller, tgt) in existing:
+            continue
+        existing.add((caller, tgt))
+        constructor = not str(node_by_id.get(tgt, {}).get("label", "")).endswith(")")
+        new_edges.append({
+            "source": caller,
+            "target": tgt,
+            "relation": "references" if constructor else "calls",
+            "context": "constructor" if constructor else "call",
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "source_file": source_file,
+            "source_location": rc.get("source_location"),
+            "weight": 1.0,
+        })
+    return new_edges
