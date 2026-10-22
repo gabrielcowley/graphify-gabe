@@ -61,13 +61,14 @@ _WORKSPACE = {
         "    crate::fixture::is_fixture_file(name) && super::fixture::is_fixture_file(name)\n}\n"
     ),
     "a/src/values.rs": (
-        "use crate::expect::{ExpectError, LIMIT};\nuse std::cmp::Ordering;\n\n"
+        "use crate::expect::{ExpectError, LIMIT};\nuse std::cmp::Ordering;\nuse std::fs;\n\n"
         "pub fn errors(e: &ExpectError) -> Result<u32, ExpectError> {\n    match e {\n"
         "        ExpectError::BattleNotStated => Err(ExpectError::BattleNotStated.into()),\n"
         "        ExpectError::Over(n) => Ok(*n + crate::expect::LIMIT + ExpectError::CAP + ExpectError::FLOOR),\n"
         "    }\n}\n\n"
         "pub fn elsewhere(e: &ExpectError) -> u32 {\n    assert!(matches!(e, ExpectError::BattleNotStated));\n"
-        "    let _ = (u32::MAX, std::u32::MAX, Ordering::Less, UNDEFINED_NAME);\n    LIMIT\n}\n\n"
+        "    let _ = (u32::MAX, std::u32::MAX, Ordering::Less, UNDEFINED_NAME);\n    let _ = fs::read(\"x\");\n"
+        "    LIMIT\n}\n\n"
         # A function's own `const` shadows the module's: neither its name nor its use is LIMIT's.
         "pub fn shadowed() -> u32 {\n    const LIMIT: u32 = 2;\n    LIMIT\n}\n"
     ),
@@ -191,6 +192,11 @@ def test_a_type_qualified_call_binds_to_the_types_method_or_variant(workspace):
     calls = _calls_from(workspace, "paths()", "a/src/other.rs")
     assert (_nid(workspace, ".exceeded()", "a/src/expect.rs"), "calls", "EXTRACTED") in calls
     assert (_nid(workspace, "Over", "a/src/expect.rs"), "references", "EXTRACTED") in calls
+
+
+def test_a_path_through_a_use_of_another_crate_binds_nothing(workspace):
+    # `use std::fs;` then `fs::read()`, with the crate's own `fs.rs` defining `read`.
+    assert _calls_from(workspace, "elsewhere()", "a/src/values.rs") == []
 
 
 def test_a_path_into_another_crate_or_language_binds_nothing(workspace):
