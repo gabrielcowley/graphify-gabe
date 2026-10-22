@@ -38,25 +38,35 @@ _WORKSPACE = {
     ),
     # The same name in another file's test module: by name alone, ambiguous.
     "a/src/order.rs": (
-        "pub fn first() -> u32 {\n    0\n}\n\n#[cfg(test)]\nmod tests {\n"
+        "pub fn first() -> u32 {\n    crate::rng::draws_between(0, 2)\n}\n\n#[cfg(test)]\nmod tests {\n"
         "    fn draws_between(from: u32, to: u32) -> u32 {\n        to - from\n    }\n}\n"
     ),
     "a/src/fixture.rs": "pub fn is_fixture_file(name: &str) -> bool {\n    name.ends_with(\".toml\")\n}\n",
-    "a/src/expect.rs": "pub const LIMIT: u32 = 4;\n\npub enum ExpectError {\n    BattleNotStated,\n}\n",
+    "a/src/expect.rs": (
+        "pub const LIMIT: u32 = 4;\n\npub enum ExpectError {\n    BattleNotStated,\n    Over(u32),\n}\n\n"
+        "impl ExpectError {\n    pub fn exceeded(n: u32) -> Self {\n        Self::Over(n)\n    }\n}\n"
+    ),
     "a/src/fs.rs": "pub fn read() {}\n",
     "a/src/renamed.rs": "pub fn relocated() {}\n",
     "a/src/other.rs": (
         "use crate::expect::{ExpectError, LIMIT};\nuse crate::moved::relocated;\n"
         "use crate::rng::draws_between;\nuse std::fs::read;\nuse serde::Serialize;\n\n"
-        "pub fn check() -> u32 {\n    relocated();\n    draws_between(0, LIMIT)\n}\n"
+        "pub fn check() -> u32 {\n    relocated();\n    draws_between(0, LIMIT)\n}\n\n"
+        "pub fn paths(name: &str) -> bool {\n    let _ = std::fs::read(name);\n    let _ = Vec::<u8>::new();\n"
+        "    let _ = util::helper();\n    let _ = ExpectError::exceeded(1);\n    let _ = crate::expect::ExpectError::Over(2);\n"
+        "    crate::fixture::is_fixture_file(name) && super::fixture::is_fixture_file(name)\n}\n"
     ),
-    "a/src/session/mod.rs": "pub fn step() {}\n\n#[cfg(test)]\nmod tests;\n",
+    # A same-named Python module beside the crate is never a Rust path's target.
+    "util.py": "def helper():\n    pass\n",
+    "a/src/session/mod.rs": (
+        "pub fn step() {}\n\npub mod inner {\n    pub fn deep() {}\n}\n\n#[cfg(test)]\nmod tests;\n"
+    ),
     # `use super::*;` brings the parent's names into scope: module evidence.
-    "a/src/session/tests.rs": "use super::*;\n\nfn steps() {\n    step();\n}\n",
+    "a/src/session/tests.rs": "use super::*;\n\nfn steps() {\n    step();\n    inner::deep();\n}\n",
     "b/src/lib.rs": (
         "use a::is_fixture_file;\nuse a::rng::draws_between;\n\n"
         "pub fn run() -> bool {\n    is_fixture_file(\"x.toml\") && draws_between(1, 2) == 1\n}\n\n"
-        "pub fn step() {}\n"
+        "pub fn step() {}\n\npub fn by_path() -> bool {\n    a::fixture::is_fixture_file(\"y.toml\")\n}\n"
     ),
     "b/tests/smoke.rs": "use b::run;\n\n#[test]\nfn runs() {\n    run();\n}\n",
 }
@@ -122,9 +132,10 @@ def test_a_bare_call_after_a_use_binds_to_what_it_imports(workspace):
 
 
 def test_a_glob_import_is_evidence_for_the_names_it_brings_in(workspace):
-    # Two `step()`s; `use super::*;` names session/mod.rs's.
-    assert _edges_from(workspace, "a/src/session/tests.rs", "calls") == [
-        (_nid(workspace, "step()", "a/src/session/mod.rs"), "EXTRACTED")]
+    # Two `step()`s; `use super::*;` names session/mod.rs's, and brings in its `inner`.
+    assert _edges_from(workspace, "a/src/session/tests.rs", "calls") == sorted([
+        (_nid(workspace, "step()", "a/src/session/mod.rs"), "EXTRACTED"),
+        (_nid(workspace, "deep()", "a/src/session/mod.rs"), "EXTRACTED")])
 
 
 def test_a_plain_module_import_is_no_evidence_for_a_bare_call(tmp_path: Path):
@@ -151,6 +162,39 @@ def test_a_glob_of_its_own_file_is_dropped(tmp_path: Path):
     assert "super" not in {n["id"] for n in result["nodes"]}
     assert (_nid(result, "helper()", "src/util.rs"), "EXTRACTED") in _edges_from(result, "src/util.rs", "calls")
 
+
+# --- path calls ---
+
+def _calls_from(result: dict, caller: str, source_file: str) -> list[tuple[str, str, str]]:
+    caller_nid = _nid(result, caller, source_file)
+    return sorted((e["target"], e["relation"], e.get("confidence", "")) for e in result["edges"]
+                  if e["source"] == caller_nid and e.get("context") in ("call", "constructor"))
+
+
+def test_a_path_call_binds_to_the_item_its_path_names(workspace):
+    fixture = _nid(workspace, "is_fixture_file()", "a/src/fixture.rs")
+    assert (fixture, "calls", "EXTRACTED") in _calls_from(workspace, "paths()", "a/src/other.rs")
+    assert (fixture, "calls", "EXTRACTED") in _calls_from(workspace, "by_path()", "b/src/lib.rs")
+
+
+def test_a_path_call_never_binds_to_a_same_named_item_in_its_own_file(workspace):
+    # `crate::rng::draws_between()` in order.rs used to bind to order.rs's own
+    # test helper, EXTRACTED.
+    assert _calls_from(workspace, "first()", "a/src/order.rs") == [
+        (_nid(workspace, "draws_between()", "a/src/rng.rs"), "calls", "EXTRACTED")]
+
+
+def test_a_type_qualified_call_binds_to_the_types_method_or_variant(workspace):
+    calls = _calls_from(workspace, "paths()", "a/src/other.rs")
+    assert (_nid(workspace, ".exceeded()", "a/src/expect.rs"), "calls", "EXTRACTED") in calls
+    assert (_nid(workspace, "Over", "a/src/expect.rs"), "references", "EXTRACTED") in calls
+
+
+def test_a_path_into_another_crate_or_language_binds_nothing(workspace):
+    targets = {target for target, _, _ in _calls_from(workspace, "paths()", "a/src/other.rs")}
+    assert _nid(workspace, "read()", "a/src/fs.rs") not in targets  # std::fs::read
+    assert _nid(workspace, "helper()", "util.py") not in targets
+    assert len(targets) == 3  # is_fixture_file, .exceeded() and Over
 
 # --- the index on its own: what resolves to nothing ---
 
@@ -182,6 +226,7 @@ def index(tmp_path_factory) -> tuple[RustPathIndex, dict, Path]:
     ("crate::inner::deep::down", ("down()", "src/inner/deep.rs")),  # `mod` inside an inline `mod`
     ("crate::inner::here", ("here()", "src/lib.rs")),
     ("crate::inner::deep::here", ("here()", "src/lib.rs")),  # a private `use` seen from below
+    ("crate::globbed", ("globbed()", "src/a.rs")),  # through `pub use a::*;`
 ])
 def test_a_path_resolves_to_exactly_one_item(index, path, expected):
     paths, result, root = index
@@ -192,7 +237,6 @@ def test_a_path_resolves_to_exactly_one_item(index, path, expected):
 @pytest.mark.parametrize("path", [
     "std::fs::read", "serde::Serialize", "a::Thing::new",
     "crate::both",  # a module and a fn: two things
-    "crate::globbed",  # only through a glob re-export
     "crate::hops",  # a file no `mod` declares
     "crate::missing", "super::a", "crate::a::Kind::Two",
 ])
@@ -233,6 +277,8 @@ def _view(graph: dict) -> tuple:
     ("a/src/other.rs", _WORKSPACE["a/src/other.rs"] + "\npub fn again() -> u32 {\n    draws_between(1, 2)\n}\n"),
     ("b/src/lib.rs", _WORKSPACE["b/src/lib.rs"].replace("use a::is_fixture_file;\n", "")),
     ("a/src/session/tests.rs", "use super::step;\n\nfn steps() {\n    step();\n}\n"),
+    ("a/src/order.rs", "pub fn first() -> bool {\n    crate::fixture::is_fixture_file(\"z\")\n}\n"),
+    ("a/src/expect.rs", _WORKSPACE["a/src/expect.rs"].replace("exceeded", "above")),
 ])
 def test_an_incremental_build_resolves_what_a_full_one_does(tmp_path: Path, changed: str, text: str):
     root, fresh = tmp_path / "incremental", tmp_path / "fresh"

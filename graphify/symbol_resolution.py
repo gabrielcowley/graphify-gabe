@@ -356,6 +356,9 @@ def resolve_cross_file_raw_calls(
             continue
         if raw_call.get("is_member_call"):
             continue
+        # A Rust path call names its item; never bind it by its last segment (#908).
+        if raw_call.get("rust_path"):
+            continue
         candidates = label_index.get(callee.lower(), [])
         if not candidates:
             continue
