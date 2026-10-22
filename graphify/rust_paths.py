@@ -272,7 +272,9 @@ def retarget_use_edges(nodes: Iterable[dict], edges: list[dict], root: Path) -> 
 def resolve_path_calls(
     raw_calls: Iterable[dict], nodes: list[dict], edges: list[dict], root: Path,
 ) -> list[dict]:
-    """`calls` edges for the Rust path calls (`rust_path` raw calls) the path names.
+    """`calls` edges for the Rust path calls (`rust_path` raw calls) the path names,
+    and `references` edges for the variants and constants named as values
+    (`rust_ref` raw calls: `E::Missing`, `LIMIT`, `Type::CONST`).
 
     The whole path is tried first: `crate::fixture::is_fixture_file`,
     `super::f`, `a::rng::draws_between`, or a variant constructor
@@ -280,8 +282,10 @@ def resolve_path_calls(
     last segment must name a type and the last one of its methods: the type's
     impl blocks are pooled across files the way `_resolve_rust_self_member_calls`
     pools them, and only when one declaration has that name; with several, only
-    the impl blocks sharing the declaration's node count. Exactly one target or
-    no edge, and every edge is EXTRACTED: the path says which item it is.
+    the impl blocks sharing the declaration's node count. A reference takes the
+    same route to an associated const, and only ever lands on a data item, never
+    a function. Exactly one target or no edge, and every edge is EXTRACTED: the
+    path says which item it is.
     """
     pending = [rc for rc in raw_calls if rc.get("rust_path") and rc.get("caller_nid")]
     if not pending:
@@ -290,7 +294,8 @@ def resolve_path_calls(
     node_by_id = {n.get("id"): n for n in nodes}
     methods: dict[tuple[str, str], set[str]] = {}
     for e in edges:
-        if e.get("relation") == "method" and (target := node_by_id.get(e.get("target"))) is not None:
+        # A type's methods, and (an impl block's `contains`) its associated consts.
+        if e.get("relation") in ("method", "contains") and (target := node_by_id.get(e.get("target"))) is not None:
             methods.setdefault((str(e.get("source")), str(target.get("label", "")).strip("()").lstrip(".")),
                                set()).add(e["target"])
     owners_by_label: dict[str, list[str]] = {}
@@ -312,6 +317,7 @@ def resolve_path_calls(
         return next(iter(found)) if len(found) == 1 else None
 
     existing = {(e.get("source"), e.get("target")) for e in edges if e.get("relation") in ("calls", "references")}
+    is_data = lambda nid: not str(node_by_id.get(nid, {}).get("label", "")).endswith(")")  # noqa: E731
     new_edges: list[dict] = []
     for rc in pending:
         source_file, scope, path = str(rc.get("source_file", "")), str(rc.get("rust_scope", "")), str(rc["rust_path"])
@@ -322,15 +328,16 @@ def resolve_path_calls(
             if owner is not None and owner[0] == "item":
                 tgt = method_of(str(owner[1]), path.rsplit("::", 1)[1])
         caller = rc["caller_nid"]
-        if tgt is None or tgt == caller or (caller, tgt) in existing:
+        reference = rc.get("rust_ref")
+        if tgt is None or tgt == caller or (caller, tgt) in existing or (reference and not is_data(tgt)):
             continue
         existing.add((caller, tgt))
-        constructor = not str(node_by_id.get(tgt, {}).get("label", "")).endswith(")")
+        constructor = is_data(tgt)
         new_edges.append({
             "source": caller,
             "target": tgt,
             "relation": "references" if constructor else "calls",
-            "context": "constructor" if constructor else "call",
+            "context": str(reference) if reference else "constructor" if constructor else "call",
             "confidence": "EXTRACTED",
             "confidence_score": 1.0,
             "source_file": source_file,

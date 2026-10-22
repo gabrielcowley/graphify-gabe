@@ -27,8 +27,8 @@ _WORKSPACE = {
         '[dependencies]\na = { path = "../a" }\n'
     ),
     "a/src/lib.rs": (
-        "pub mod expect;\npub mod fixture;\npub mod fs;\npub mod order;\npub mod other;\n"
-        "pub mod rng;\npub mod session;\n#[path = \"renamed.rs\"]\npub mod moved;\n"
+        "pub mod expect;\npub mod fixture;\npub mod floor;\npub mod fs;\npub mod order;\npub mod other;\n"
+        "pub mod rng;\npub mod session;\npub mod values;\n#[path = \"renamed.rs\"]\npub mod moved;\n"
         "pub use fixture::is_fixture_file;\n"
     ),
     "a/src/rng.rs": (
@@ -44,9 +44,13 @@ _WORKSPACE = {
     "a/src/fixture.rs": "pub fn is_fixture_file(name: &str) -> bool {\n    name.ends_with(\".toml\")\n}\n",
     "a/src/expect.rs": (
         "pub const LIMIT: u32 = 4;\n\npub enum ExpectError {\n    BattleNotStated,\n    Over(u32),\n}\n\n"
-        "impl ExpectError {\n    pub fn exceeded(n: u32) -> Self {\n        Self::Over(n)\n    }\n}\n"
+        "impl ExpectError {\n    pub const CAP: u32 = 9;\n\n    pub fn exceeded(n: u32) -> Self {\n        Self::Over(n)\n    }\n\n"
+        "    pub fn kind(&self) -> &str {\n        match self {\n            Self::BattleNotStated => \"battle\",\n"
+        "            Self::Over(_) => \"over\",\n        }\n    }\n}\n"
     ),
     "a/src/fs.rs": "pub fn read() {}\n",
+    # An associated const in an impl block away from the type's declaration.
+    "a/src/floor.rs": "use crate::expect::ExpectError;\n\nimpl ExpectError {\n    pub const FLOOR: u32 = 1;\n}\n",
     "a/src/renamed.rs": "pub fn relocated() {}\n",
     "a/src/other.rs": (
         "use crate::expect::{ExpectError, LIMIT};\nuse crate::moved::relocated;\n"
@@ -55,6 +59,15 @@ _WORKSPACE = {
         "pub fn paths(name: &str) -> bool {\n    let _ = std::fs::read(name);\n    let _ = fs::read(name);\n    let _ = Vec::<u8>::new();\n"
         "    let _ = util::helper();\n    let _ = ExpectError::exceeded(1);\n    let _ = crate::expect::ExpectError::Over(2);\n"
         "    crate::fixture::is_fixture_file(name) && super::fixture::is_fixture_file(name)\n}\n"
+    ),
+    "a/src/values.rs": (
+        "use crate::expect::{ExpectError, LIMIT};\nuse std::cmp::Ordering;\n\n"
+        "pub fn errors(e: &ExpectError) -> Result<u32, ExpectError> {\n    match e {\n"
+        "        ExpectError::BattleNotStated => Err(ExpectError::BattleNotStated.into()),\n"
+        "        ExpectError::Over(n) => Ok(*n + crate::expect::LIMIT + ExpectError::CAP + ExpectError::FLOOR),\n"
+        "    }\n}\n\n"
+        "pub fn elsewhere(e: &ExpectError) -> u32 {\n    assert!(matches!(e, ExpectError::BattleNotStated));\n"
+        "    let _ = (u32::MAX, std::u32::MAX, Ordering::Less, UNDEFINED_NAME);\n    LIMIT\n}\n"
     ),
     # A same-named Python module beside the crate is never a Rust path's target.
     "util.py": "def helper():\n    pass\n",
@@ -225,6 +238,40 @@ def test_a_path_into_another_crate_or_language_binds_nothing(workspace):
     assert _nid(workspace, "helper()", "util.py") not in targets
     assert len(targets) == 3  # is_fixture_file, .exceeded() and Over
 
+
+# --- variants and constants as values ---
+
+def _references_from(result: dict, caller: str, source_file: str) -> list[tuple[str, str, str]]:
+    caller_nid = _nid(result, caller, source_file)
+    return sorted((e["target"], e.get("context", ""), e.get("confidence", "")) for e in result["edges"]
+                  if e["source"] == caller_nid and e["relation"] == "references"
+                  and e.get("context") in ("variant", "const", "match"))
+
+
+def test_a_variant_or_constant_named_as_a_value_is_a_reference(workspace):
+    variant = _nid(workspace, "BattleNotStated", "a/src/expect.rs")
+    refs = _references_from(workspace, "errors()", "a/src/values.rs")
+    assert (variant, "match", "EXTRACTED") in refs  # `ExpectError::BattleNotStated =>`
+    assert (variant, "variant", "EXTRACTED") not in refs  # one edge per pair, the first context
+    assert (_nid(workspace, "Over", "a/src/expect.rs"), "match", "EXTRACTED") in refs
+    assert (_nid(workspace, "LIMIT", "a/src/expect.rs"), "const", "EXTRACTED") in refs  # a path to a module's const
+    assert (_nid(workspace, ".CAP", "a/src/expect.rs"), "const", "EXTRACTED") in refs  # an associated const
+    assert (_nid(workspace, ".FLOOR", "a/src/floor.rs"), "const", "EXTRACTED") in refs  # in another file's impl
+
+
+def test_a_self_variant_in_its_own_impl_is_a_reference(workspace):
+    refs = _references_from(workspace, ".kind()", "a/src/expect.rs")
+    assert (_nid(workspace, "BattleNotStated", "a/src/expect.rs"), "match", "EXTRACTED") in refs
+    assert (_nid(workspace, "Over", "a/src/expect.rs"), "match", "EXTRACTED") in refs
+
+
+def test_a_bare_constant_resolves_through_its_use(workspace):
+    limit = _nid(workspace, "LIMIT", "a/src/expect.rs")
+    assert _references_from(workspace, "elsewhere()", "a/src/values.rs") == [(limit, "const", "EXTRACTED")]
+    assert (limit, "const", "EXTRACTED") in _references_from(workspace, "check()", "a/src/other.rs")
+    # Not `matches!(…)`'s variant (a macro's arguments are not parsed), nor std's or
+    # an undefined name's constants.
+
 # --- the index on its own: what resolves to nothing ---
 
 _INDEX = {
@@ -308,6 +355,8 @@ def _view(graph: dict) -> tuple:
     ("a/src/session/tests.rs", "use super::step;\n\nfn steps() {\n    step();\n}\n"),
     ("a/src/order.rs", "pub fn first() -> bool {\n    crate::fixture::is_fixture_file(\"z\")\n}\n"),
     ("a/src/expect.rs", _WORKSPACE["a/src/expect.rs"].replace("exceeded", "above")),
+    ("a/src/floor.rs", _WORKSPACE["a/src/floor.rs"].replace("FLOOR", "BASE")),
+    ("a/src/values.rs", _WORKSPACE["a/src/values.rs"] + "\npub fn more() -> u32 {\n    ExpectError::CAP\n}\n"),
 ])
 def test_an_incremental_build_resolves_what_a_full_one_does(tmp_path: Path, changed: str, text: str):
     root, fresh = tmp_path / "incremental", tmp_path / "fresh"

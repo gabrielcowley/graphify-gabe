@@ -274,6 +274,37 @@ def _rust_path_may_be_local(segments: tuple[str, ...], local_types: set[str]) ->
     return not (len(segments) == 2 and builtin and first not in local_types)
 
 
+# A constant's name, as Rust spells one: `LIMIT`, `MAX_LEN`, `E2`. One letter is
+# more often a const generic or a type parameter than a constant.
+_RUST_CONST_NAME = re.compile(r"[A-Z][A-Z0-9_]*[A-Z0-9][A-Z0-9_]*")
+
+# Where an identifier or a path is not a reference of its own: part of a longer
+# path, a macro's name or token tree, a generic call's function, or a binding.
+_RUST_NOT_A_REFERENCE_PARENTS = frozenset({
+    "scoped_identifier", "scoped_type_identifier", "macro_invocation", "token_tree",
+    "generic_function", "let_declaration", "parameter", "closure_parameters",
+    "shorthand_field_initializer",
+})
+
+_RUST_PATTERN_NODES = frozenset({
+    "tuple_struct_pattern", "tuple_pattern", "or_pattern", "slice_pattern", "reference_pattern",
+    "ref_pattern", "captured_pattern", "struct_pattern", "mut_pattern", "range_pattern",
+})
+
+
+def _rust_in_pattern(node) -> bool:
+    """Whether ``node`` is (inside) a `match` arm's or an `if let`'s pattern."""
+    child, parent = node, node.parent
+    while parent is not None and parent.type in _RUST_PATTERN_NODES:
+        child, parent = parent, parent.parent
+    if parent is None:
+        return False
+    if parent.type == "match_pattern":
+        return True
+    pattern = parent.child_by_field_name("pattern") if parent.type in ("let_condition", "let_chain") else None
+    return pattern is not None and pattern.start_byte == child.start_byte and pattern.end_byte == child.end_byte
+
+
 def _rust_type_last_segment(text: str) -> str:
     """`crate::a::Foo<T>` -> `Foo`: the last path segment, generic arguments dropped.
     A leading `&`, `&'a mut` or `dyn` (`impl Tr for &'a Foo`) is not part of it."""
@@ -766,6 +797,8 @@ def extract_rust(path: Path) -> dict:
                     item_nid = _make_id(parent_impl_nid, item_name)
                     add_node(item_nid, f".{item_name}", line)
                     add_edge(parent_impl_nid, item_nid, "contains", line)
+                    if parent_impl_type:  # `Type::CONST` names an associated const
+                        mark_item_path(item_nid, _rust_type_last_segment(parent_impl_type), item_name)
                 else:
                     item_nid = file_item_nid(_make_id(stem, item_name), item_name)
                     add_node(item_nid, item_name, line)
@@ -973,6 +1006,59 @@ def extract_rust(path: Path) -> dict:
             return None  # `crate::`, a `use`d name, a file module or another crate
         return in_file_items.get("::".join(base + rest)) if rest else None
 
+    def reference(node, caller_nid: str, self_type: str | None, scope: tuple[str, ...]) -> None:
+        # A variant or constant named as a value or in a pattern: `Err(E::Missing)`,
+        # `E::Missing =>`, `LIMIT`, `crate::config::LIMIT`, `Type::CONST`. The
+        # function of a call is a call (above), and a path's prefix is part of it.
+        parent = node.parent
+        if parent is None or parent.type in _RUST_NOT_A_REFERENCE_PARENTS:
+            return
+        if parent.type == "call_expression" and parent.child_by_field_name("function") == node:
+            return
+        if node.type == "identifier":
+            name = _read_text(node, source)
+            if not _RUST_CONST_NAME.fullmatch(name):
+                return
+            segments: tuple[str, ...] | None = (name,)
+        else:
+            segments = _rust_call_path(node, source)
+            if not segments or not (_RUST_CONST_NAME.fullmatch(segments[-1]) or (
+                    segments[-1][:1].isupper() and segments[-2][:1].isupper())):
+                return
+            if segments[0] == "Self":
+                if not self_type:
+                    return
+                segments = (_rust_type_last_segment(self_type), *segments[1:])
+        context = "match" if _rust_in_pattern(node) else (
+            "const" if _RUST_CONST_NAME.fullmatch(segments[-1]) else "variant")
+        if len(segments) == 1:
+            tgt_nid = in_file_items.get("::".join([*scope, segments[0]]))
+        else:
+            tgt_nid = in_file_target(segments, scope)
+            if tgt_nid is None and segments[-2][:1].isupper():
+                # `Type::Variant`: the type as this module or the file's top sees it.
+                tgt_nid = (in_file_items.get("::".join([*scope, *segments]))
+                           or in_file_items.get("::".join(segments)))
+        if tgt_nid is not None:
+            pair = (caller_nid, tgt_nid)
+            if tgt_nid in type_nids and tgt_nid != caller_nid and pair not in seen_call_pairs:
+                seen_call_pairs.add(pair)
+                add_edge(caller_nid, tgt_nid, "references", node.start_point[0] + 1, context=context)
+            return
+        if len(segments) == 1 or _rust_path_may_be_local(segments, local_types):
+            rc_entry = {
+                "caller_nid": caller_nid,
+                "callee": segments[-1],
+                "is_member_call": False,
+                "rust_path": "::".join(segments),
+                "rust_ref": context,
+                "source_file": str_path,
+                "source_location": f"L{node.start_point[0] + 1}",
+            }
+            if scope:
+                rc_entry["rust_scope"] = "::".join(scope)
+            raw_calls.append(rc_entry)
+
     def walk_calls(
         node,
         caller_nid: str,
@@ -980,8 +1066,10 @@ def extract_rust(path: Path) -> dict:
         self_impl_key: str | None = None,
         scope: tuple[str, ...] = (),
     ) -> None:
-        if node.type == "function_item":
+        if node.type in ("function_item", "use_declaration", "attribute_item"):
             return
+        if node.type in ("scoped_identifier", "identifier"):
+            reference(node, caller_nid, self_type, scope)
         if node.type == "macro_invocation":
             # `name!(...)` invoking a macro_rules! macro defined in this file.
             # Resolve only a bare `identifier` macro against the local registry;
