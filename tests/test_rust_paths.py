@@ -150,6 +150,18 @@ def test_a_plain_module_import_is_no_evidence_for_a_bare_call(tmp_path: Path):
     assert all(confidence != "EXTRACTED" for _, confidence in _edges_from(result, "src/user.rs", "calls"))
 
 
+def test_a_named_import_shadows_a_glob_even_when_it_names_nothing(tmp_path: Path):
+    files = {
+        "Cargo.toml": '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": "pub mod util;\npub struct Cursor;\npub struct Other;\n",
+        "src/util.rs": "use super::*;\nuse std::io::Cursor;\n",
+    }
+    result = _extract(tmp_path, files)
+    paths = RustPathIndex(result["nodes"], tmp_path)
+    assert paths.resolve("src/util.rs", "", "Cursor", tmp_path) is None  # std's, not lib.rs's
+    assert paths.resolve("src/util.rs", "", "Other", tmp_path) == ("item", _nid(result, "Other", "src/lib.rs"))
+
+
 def test_a_glob_of_its_own_file_is_dropped(tmp_path: Path):
     # `use super::*;` in a file's inline test module imports that file: no edge, and
     # no `super` stub left holding it.

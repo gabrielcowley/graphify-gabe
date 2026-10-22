@@ -219,8 +219,9 @@ class RustPathIndex:
             for segments in by_name.get(name, ()):
                 found |= self._walk((root_file, module), segments, hops - 1)
             # A glob (`use super::*;`) brings in every name of what it imports, but
-            # anything the module declares or imports by name shadows it.
-            if not found:
+            # anything the module declares or imports by name shadows it, even an
+            # import that names nothing here (`use std::io::Cursor;`).
+            if not found and name not in by_name:
                 for segments in globs:
                     for source in self._walk((root_file, module), segments, hops - 1):
                         found |= self._member(source, name, hops - 1)
