@@ -247,7 +247,7 @@ def _references_from(result: dict, caller: str, source_file: str) -> list[tuple[
     caller_nid = _nid(result, caller, source_file)
     return sorted((e["target"], e.get("context", ""), e.get("confidence", "")) for e in result["edges"]
                   if e["source"] == caller_nid and e["relation"] == "references"
-                  and e.get("context") in ("variant", "const", "match"))
+                  and e.get("context") in ("variant", "const", "match", "constructor"))
 
 
 def test_a_variant_or_constant_named_as_a_value_is_a_reference(workspace):
@@ -274,6 +274,24 @@ def test_a_bare_constant_resolves_through_its_use(workspace):
     assert _references_from(workspace, "shadowed()", "a/src/values.rs") == []
     # Not `matches!(…)`'s variant (a macro's arguments are not parsed), nor std's or
     # an undefined name's constants.
+
+def test_a_struct_style_variant_is_a_reference(tmp_path: Path):
+    # `E::V { .. }` spells its path as a type, not a value: as a literal it constructs
+    # the variant, as a pattern it matches it. A struct by its path is the same.
+    result = _extract(tmp_path, {
+        "Cargo.toml": '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": "pub mod err;\npub mod user;\n",
+        "src/err.rs": "pub enum RouteError {\n    NoPath { from: u32 },\n}\n\npub struct Cfg {\n    pub a: u32,\n}\n",
+        "src/user.rs": (
+            "use crate::err::RouteError;\n\npub fn fail() -> RouteError {\n    RouteError::NoPath { from: 1 }\n}\n\n"
+            "pub fn from(e: RouteError) -> u32 {\n    match e {\n        RouteError::NoPath { from } => from,\n    }\n}\n\n"
+            "pub fn cfg() -> u32 {\n    crate::err::Cfg { a: 1 }.a\n}\n"
+        )})
+    no_path = _nid(result, "NoPath", "src/err.rs")
+    assert (no_path, "constructor", "EXTRACTED") in _references_from(result, "fail()", "src/user.rs")
+    assert (no_path, "match", "EXTRACTED") in _references_from(result, "from()", "src/user.rs")
+    assert _references_from(result, "cfg()", "src/user.rs") == [(_nid(result, "Cfg", "src/err.rs"), "constructor", "EXTRACTED")]
+
 
 # --- the index on its own: what resolves to nothing ---
 

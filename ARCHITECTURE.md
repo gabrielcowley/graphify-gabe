@@ -156,6 +156,8 @@ reaches the bare-name cross-file pass (#908), and in its own file it binds only
 where the path leads, not to any same-named item there. A variant or constant
 named as a value or in a pattern (`Err(E::Missing)`, `E::Missing =>`, `LIMIT`,
 `Type::CONST`) is a `references` edge with context `variant`, `const` or
-`match`, resolved the same way and only ever to a data item. A macro's
+`match`, resolved the same way and only ever to a data item; a struct-style
+variant or a struct by its path (`E::Missing { at }`) is one with context
+`constructor`, or `match` as a pattern. A macro's
 arguments are an unparsed token tree, so `matches!(e, E::Missing)` gets none.
 AST cache schemas 23 to 25 retire cached Rust results that lack the markers.
