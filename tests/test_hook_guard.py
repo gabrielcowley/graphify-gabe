@@ -545,6 +545,35 @@ def test_oversized_graph_keeps_the_plain_nudge(tmp_path, monkeypatch):
     assert out == cli._SEARCH_NUDGE
 
 
+def test_later_hints_read_the_index_not_the_graph(tmp_path, monkeypatch):
+    from graphify import cli
+    payload = {"tool_input": {"pattern": "load_config"}}
+    assert "- load_config() (src/app.py L10)" in _ctx(_invoke_with_graph("search", payload, tmp_path, monkeypatch))
+    assert (tmp_path / "graphify-out" / "cache" / "hint-index.json").is_file()
+    # Over the cap now, so only the index can still answer.
+    monkeypatch.setattr(cli, "_HINT_GRAPH_MAX_BYTES", 10)
+    out = _invoke("search", payload, tmp_path, monkeypatch, graph=False)
+    assert "- load_config() (src/app.py L10)" in _ctx(out)
+
+
+def test_a_rebuilt_graph_retires_the_index(tmp_path, monkeypatch):
+    payload = {"tool_input": {"pattern": "load_config"}}
+    _invoke_with_graph("search", payload, tmp_path, monkeypatch)
+    (tmp_path / "graphify-out" / "graph.json").write_text(json.dumps({"nodes": [
+        {"id": "a", "label": "load_config()", "source_file": "src/moved.py", "source_location": "L7"}]}), encoding="utf-8")
+    ctx = _ctx(_invoke("search", payload, tmp_path, monkeypatch, graph=False))
+    assert "- load_config() (src/moved.py L7)" in ctx
+    assert "src/app.py" not in ctx
+
+
+@pytest.mark.parametrize("index_text", ["not json", "[]", '{"graph": 1, "nodes": [[1]]}', '{"nodes": "abc"}'])
+def test_a_malformed_index_is_rebuilt(index_text, tmp_path, monkeypatch):
+    (tmp_path / "graphify-out" / "cache").mkdir(parents=True)
+    (tmp_path / "graphify-out" / "cache" / "hint-index.json").write_text(index_text, encoding="utf-8")
+    ctx = _ctx(_invoke_with_graph("search", {"tool_input": {"pattern": "load_config"}}, tmp_path, monkeypatch))
+    assert "- load_config() (src/app.py L10)" in ctx
+
+
 def test_search_nudge_without_exact_label_suggests_query(tmp_path, monkeypatch):
     ctx = _ctx(_invoke_with_graph("search", {"tool_input": {"pattern": "config"}}, tmp_path, monkeypatch))
     assert 'Start with: `graphify query "config"`' in ctx

@@ -156,11 +156,15 @@ def _default_graph_path() -> str:
 
 # Hint for a firing nudge: the graph nodes behind this very call and a command
 # to run, so the nudge shows what the graph knows instead of only asking for it.
-# A direct label scan of graph.json, not `graphify query`: loading the full query
-# stack costs ~1.5 s on a 15k-node graph, too slow for a per-call hook. The scan
-# costs ~0.5 s on an 18 MiB graph; bigger graphs than the cap get the plain nudge.
+# A direct label scan, not `graphify query`: loading the full query stack costs
+# ~1.5 s on a 15k-node graph, too slow for a per-call hook. Parsing graph.json
+# itself costs ~0.25 s at 30 MB, so the first hint after a rebuild keeps each
+# node's label, file and location in cache/hint-index.json (~5% of the graph,
+# ~10 ms to read) and later hints read that. Only that one parse is capped:
+# a bigger graph than the cap gets the plain nudge.
 _HINT_MAX_NODES = 5
-_HINT_GRAPH_MAX_BYTES = 24 * 1024 * 1024
+_HINT_GRAPH_MAX_BYTES = 96 * 1024 * 1024
+_HINT_FIELDS = ("label", "source_file", "source_location")
 _HINT_TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 _HINT_SAFE_ARG_RE = re.compile(r"[\w.\-() ]+")
 # Declaration keywords a pattern like `def load_config` carries; never the target.
@@ -233,16 +237,40 @@ def _hint_text(value: object, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - 1] + "…"
 
 
+def _hint_nodes(graph: Path) -> list[dict]:
+    """Each node of ``graph`` as its `_HINT_FIELDS`: from the hint index when it was
+    written for this graph (same size and mtime), else parsed from the graph and
+    kept in a new index. [] for an oversized graph."""
+    stat = graph.stat()
+    stamp = [stat.st_size, stat.st_mtime_ns]
+    index = graph.parent / "cache" / "hint-index.json"
+    try:
+        kept = json.loads(index.read_text(encoding="utf-8"))
+        rows = kept["nodes"] if kept.get("graph") == stamp else None
+        if isinstance(rows, list) and all(isinstance(r, list) and len(r) == len(_HINT_FIELDS) for r in rows):
+            return [dict(zip(_HINT_FIELDS, r)) for r in rows]
+    except (OSError, ValueError, AttributeError, KeyError):
+        pass
+    if stat.st_size > _HINT_GRAPH_MAX_BYTES:
+        return []
+    nodes = json.loads(graph.read_text(encoding="utf-8")).get("nodes")
+    rows = [[n.get(f) for f in _HINT_FIELDS] for n in nodes if isinstance(n, dict)] if isinstance(nodes, list) else []
+    try:
+        index.parent.mkdir(parents=True, exist_ok=True)
+        tmp = index.with_name(f"{index.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"graph": stamp, "nodes": rows}, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, index)
+    except OSError:
+        pass
+    return [dict(zip(_HINT_FIELDS, r)) for r in rows]
+
+
 def _graph_hint(terms: "list[str]", rel_file: "str | None") -> tuple[str, list[str]]:
     """(command, node lines) for a nudge: nodes whose label matches the searched
     terms, or the symbols in the file being read. ("", []) for an oversized graph
     or no match."""
     from graphify.paths import out_path
-    p = out_path("graph.json")
-    if p.stat().st_size > _HINT_GRAPH_MAX_BYTES:
-        return "", []
-    nodes = json.loads(p.read_text(encoding="utf-8")).get("nodes")
-    nodes = [n for n in nodes if isinstance(n, dict)] if isinstance(nodes, list) else []
+    nodes = _hint_nodes(out_path("graph.json"))
 
     def key(n: dict) -> str:
         return str(n.get("label") or "").lower().removesuffix("()").lstrip(".")
