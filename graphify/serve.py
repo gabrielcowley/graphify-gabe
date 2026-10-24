@@ -215,6 +215,8 @@ def _strip_diacritics(text: str | None) -> str:
     import unicodedata
     if not isinstance(text, str):
         text = "" if text is None else str(text)
+    if text.isascii():
+        return text  # NFKD leaves ASCII alone and it holds no combining marks
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
@@ -489,6 +491,75 @@ def _get_trigram_index(G: nx.Graph) -> dict:
     idx = {"ids": ids, "postings": postings, "set_cache": {}}
     G.graph["_trigram_index"] = idx
     return idx
+
+
+def _get_exact_index(G: nx.Graph) -> dict:
+    """Lazily build and cache the maps that answer `_find_node_tiers`' exact tiers.
+
+    Each map is keyed by the very strings those tiers compare, so a lookup is
+    three dict hits instead of a scan: `by_term` by the label forms the tokenized query
+    is compared with, `by_norm` by those the punctuated query is, `by_source` by
+    the tokenized source path. Values are node positions, ascending, so a hit can
+    be put back in graph-iteration order. One pass builds it, a fraction of the
+    trigram index's cost. Cached on `G.graph` like `_get_trigram_index`.
+    """
+    idx = G.graph.get("_exact_index")
+    if idx is not None:
+        return idx
+    by_term: dict[str, list[int]] = {}
+    by_norm: dict[str, list[int]] = {}
+    by_source: dict[str, list[int]] = {}
+    source_tokens_cache: dict[str, str] = {}
+
+    def add(index: dict[str, list[int]], keys: set[str], i: int) -> None:
+        for key in keys:
+            index.setdefault(key, []).append(i)
+
+    for i, (nid, d) in enumerate(G.nodes(data=True)):
+        norm_label = d.get("norm_label") or _strip_diacritics(d.get("label") or "").lower()
+        bare_label = norm_label.rstrip("()")
+        label_tokens = " ".join(_search_tokens(d.get("label") or ""))
+        nid_lower = nid.lower()
+        nid_norm = nid_lower if nid.isascii() else _strip_diacritics(nid).lower()
+        source = d.get("source_file") or ""
+        source_tokens = source_tokens_cache.get(source)
+        if source_tokens is None:
+            source_tokens = source_tokens_cache[source] = " ".join(_search_tokens(source))
+        add(by_term, {norm_label, bare_label, label_tokens, nid_lower}, i)
+        add(by_norm, {norm_label, bare_label, nid_norm}, i)
+        add(by_source, {source_tokens}, i)
+    idx = {"ids": list(G.nodes()), "by_term": by_term, "by_norm": by_norm, "by_source": by_source}
+    G.graph["_exact_index"] = idx
+    return idx
+
+
+def _tier_candidates(G: nx.Graph, needles: list[str]) -> list[str] | None:
+    """`_trigram_candidates` for the tier lookups, or None (scan every node) on the
+    first lookup a graph gets while its trigram index is unbuilt.
+
+    The index costs several full scans to build, so it pays only on a graph that is
+    searched again: the MCP server's. A CLI call loads the graph for one lookup,
+    where building it was most of the call. The second lookup on a graph builds it
+    as before, so a long-lived graph keeps its fast path.
+    """
+    if "_trigram_index" not in G.graph:
+        searched = G.graph.get("_tier_lookups", 0)
+        G.graph["_tier_lookups"] = searched + 1
+        if not searched:
+            return None
+    return _trigram_candidates(G, needles)
+
+
+def _exact_tiers(G: nx.Graph, term: str, norm_query: str) -> tuple[list[str], list[str]]:
+    """`(source_exact, exact)` exactly as `_find_node_tiers`' scan sorts them, from the
+    exact index. A node in `source_exact` is left out of `exact`, as the scan's
+    `elif` does, and both keep graph-iteration order."""
+    idx = _get_exact_index(G)
+    ids = idx["ids"]
+    source_pos = idx["by_source"].get(term, [])
+    exact_pos = set(idx["by_term"].get(term, ())) | set(idx["by_norm"].get(norm_query, ()))
+    exact_pos.difference_update(source_pos)
+    return [ids[i] for i in source_pos], [ids[i] for i in sorted(exact_pos)]
 
 
 def _trigram_candidates(G: nx.Graph, needles: list[str], *, guard_frac: float = 0.10) -> list[str] | None:
@@ -1550,7 +1621,7 @@ def _resolve_path_scoped_symbol(G: nx.Graph, path_part: str, symbol_part: str) -
     norm_symbol_query = _strip_diacritics(symbol_part).lower().strip()
     if not (path_tokens or norm_path_query) or not (symbol_term or norm_symbol_query):
         return []
-    candidate_ids = _trigram_candidates(G, [symbol_term, norm_symbol_query])
+    candidate_ids = _tier_candidates(G, [symbol_term, norm_symbol_query])
     node_iter = (
         G.nodes(data=True) if candidate_ids is None
         else ((nid, G.nodes[nid]) for nid in candidate_ids)
@@ -1590,23 +1661,8 @@ def _label_has_literal_exact_match(G: nx.Graph, term: str, norm_query: str) -> b
     verbatim, so this is a safe way to prefer the literal interpretation
     whenever one genuinely exists.
     """
-    candidate_ids = _trigram_candidates(G, [term, norm_query])
-    node_iter = (
-        G.nodes(data=True) if candidate_ids is None
-        else ((nid, G.nodes[nid]) for nid in candidate_ids)
-    )
-    for nid, d in node_iter:
-        norm_label = d.get("norm_label") or _strip_diacritics(d.get("label") or "").lower()
-        bare_label = norm_label.rstrip("()")
-        label_tokens = " ".join(_search_tokens(d.get("label") or ""))
-        nid_lower = nid.lower()
-        nid_norm = nid_lower if nid.isascii() else _strip_diacritics(nid).lower()
-        if (
-            term == norm_label or term == bare_label or term == label_tokens or term == nid_lower
-            or norm_query == norm_label or norm_query == bare_label or norm_query == nid_norm
-        ):
-            return True
-    return False
+    idx = _get_exact_index(G)
+    return bool(idx["by_term"].get(term) or idx["by_norm"].get(norm_query))
 
 
 # `pkg.mod.func`, `pkg.mod.func()` or `pkg.mod:func` (#4366).
@@ -1627,9 +1683,13 @@ def _resolve_python_qualified(G: nx.Graph, label: str) -> list[str]:
 
 
 def _find_node_tiers(
-    G: nx.Graph, label: str
+    G: nx.Graph, label: str, *, winning_tier_only: bool = False
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """Return match tiers in precedence order: (source_exact, exact, prefix, substring).
+
+    With `winning_tier_only`, prefix and substring come back empty whenever
+    source_exact or exact is not: for callers that read the first non-empty tier
+    alone, which an exact hit then answers from the exact index without a scan.
 
     Split out of `_find_node` so callers that must not guess between equally-good
     matches can inspect the winning tier alone. `_find_node` flattens these, and
@@ -1683,13 +1743,22 @@ def _find_node_tiers(
     exact: list[str] = []
     prefix: list[str] = []
     substring: list[str] = []
-    # Trigram prefilter (graph-iteration order preserved so exact/prefix/substring
-    # ordering — and thus matches[0] — is byte-identical to the full scan).
-    candidate_ids = _trigram_candidates(G, [term, norm_query])
-    node_iter = (
-        G.nodes(data=True) if candidate_ids is None
-        else ((nid, G.nodes[nid]) for nid in candidate_ids)
-    )
+    # A caller that wants only the winning tier is done when an exact tier holds
+    # anything, and the exact index answers that without the trigram index, whose
+    # build is most of a one-shot CLI lookup's time.
+    if winning_tier_only:
+        source_exact, exact = _exact_tiers(G, term, norm_query)
+    if source_exact or exact:
+        node_iter = iter(())
+    else:
+        # Trigram prefilter from a graph's second lookup on (graph-iteration order
+        # preserved so exact/prefix/substring ordering — and thus matches[0] — is
+        # byte-identical to the full scan).
+        candidate_ids = _tier_candidates(G, [term, norm_query])
+        node_iter = (
+            G.nodes(data=True) if candidate_ids is None
+            else ((nid, G.nodes[nid]) for nid in candidate_ids)
+        )
     for nid, d in node_iter:
         norm_label = d.get("norm_label") or _strip_diacritics(d.get("label") or "").lower()
         bare_label = norm_label.rstrip("()")
@@ -1762,7 +1831,7 @@ def find_node_ambiguity(G: nx.Graph, label: str) -> list[str]:
     `_disambiguate_file_node_labels` (#2032) already relabels colliding *file*
     nodes; this covers the symbol case it does not reach.
     """
-    for tier in _find_node_tiers(G, label):
+    for tier in _find_node_tiers(G, label, winning_tier_only=True):
         if tier:
             return _rivals_across_files(G, tier)
     return []
@@ -1831,7 +1900,7 @@ def _resolve_single_node(G: nx.Graph, label: str) -> tuple[str | None, str | Non
     which is a search hit, so it comes back as a near miss with suggestions
     instead of a different node presented as the answer (#3917).
     """
-    source_exact, exact, prefix, substring = _find_node_tiers(G, label)
+    source_exact, exact, prefix, substring = _find_node_tiers(G, label, winning_tier_only=True)
     if not (source_exact or exact or prefix):
         if not substring:
             return None, f"No node matching '{label}' found."
@@ -1856,7 +1925,7 @@ def _query_name_refusal(G: nx.Graph, label: str) -> str | None:
     scoring. (`explain`/`path`/get_node keep using `_resolve_single_node`, where a
     prefix shorthand still resolves but a substring hit is a near miss, not an answer.)
     """
-    source_exact, exact, _prefix, _substring = _find_node_tiers(G, label)
+    source_exact, exact, _prefix, _substring = _find_node_tiers(G, label, winning_tier_only=True)
     tier = source_exact or exact
     if not tier:
         return None
@@ -1990,7 +2059,7 @@ def _resolve_path_endpoint(
     score fallback picked the node; ``(None, [], message)`` when ambiguous; and
     ``(None, [], None)`` when nothing matches.
     """
-    source_exact, exact, _, _ = _find_node_tiers(G, query)
+    source_exact, exact, _, _ = _find_node_tiers(G, query, winning_tier_only=True)
     hits = source_exact or exact
     if hits:
         # A `path::symbol` hit also lands in `source_exact`; only a plain path
