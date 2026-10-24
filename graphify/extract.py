@@ -7494,15 +7494,20 @@ def _resolve_rust_typed_member_calls(
             return None
         if "t" in desc:
             return None if want_ok else _type(desc["t"], from_file)
+        if "held" in desc:
+            # An `Option<T>` / `Vec<T>` binding: only its `Some`, `Ok` or element is a `T`.
+            return _eval(desc["held"], from_file, False, depth + 1) if want_ok else None
         if "field" in desc:
-            owner = None if want_ok else _eval(desc.get("of"), from_file, False, depth + 1)
+            owner = _eval(desc.get("of"), from_file, False, depth + 1)
             if owner is None:
                 return None
             decl = _pick(
                 [d for d in declared_by_type.get(owner[0], []) if _same(_file(d), owner[1])],
                 from_file,
             )
-            fields = node_by_id.get(decl, {}).get("_rust_fields") if decl else None
+            # The field's own type, or (wanting what it holds) its Option's or
+            # collection's element.
+            fields = node_by_id.get(decl, {}).get("_rust_field_holds" if want_ok else "_rust_fields") if decl else None
             return _type(fields.get(desc["field"]), _file(decl)) if isinstance(fields, dict) and decl else None
         if "assoc" in desc:
             owner = _type(desc["assoc"], from_file)
@@ -7547,8 +7552,10 @@ def _resolve_rust_typed_member_calls(
 
 def _resolve_rust_field_accesses(accesses, all_nodes, all_edges, _eval, _file, _same, _pick,
                                  declared_by_type) -> None:
-    """Bind each `x.field` read or write, and `T { field: .. }` initialiser, to the
-    `T.field` node of the struct the receiver's type names.
+    """Bind each `x.field` read or write, `T { field: .. }` initialiser and
+    `T { field, .. }` pattern to the `T.field` node of the struct the receiver's
+    type names, or, for `E::V { field }`, to the `V.field` node of the variant
+    (found through the enum's `case_of` edges).
 
     The receiver is evaluated as `_resolve_rust_typed_member_calls` evaluates a
     method call's, through the same closures, and the same uniqueness applies: a
@@ -7566,23 +7573,49 @@ def _resolve_rust_field_accesses(accesses, all_nodes, all_edges, _eval, _file, _
         tgt = node_by_id.get(str(e.get("target") or ""))
         if tgt is not None and tgt.get("_rust_field"):
             fields_of[(str(e.get("source")), str(tgt["_rust_field"]))] = str(tgt["id"])
-    seen = {(e.get("source"), e.get("target"), e.get("relation"))
-            for e in all_edges if e.get("relation") in ("reads", "writes")}
+    # An enum's variants, by (enum declaration, variant name), for `E::V { f }`.
+    variants_of: dict[tuple[str, str], str] = {}
+    for e in all_edges:
+        if e.get("relation") == "case_of":
+            tgt = node_by_id.get(str(e.get("target") or ""))
+            if tgt is not None:
+                variants_of[(str(e.get("source")), str(tgt.get("label") or ""))] = str(tgt["id"])
+    # One edge per (function, field): the graph keeps one edge per node pair, so
+    # a function that reads and writes a field is one `writes` edge carrying the
+    # read's line as `also_reads`, rather than a `reads` edge the write replaces.
+    by_pair: dict[tuple[str, str], dict] = {
+        (str(e.get("source")), str(e.get("target"))): e
+        for e in all_edges if e.get("relation") in ("reads", "writes")
+    }
     for fa in accesses:
         caller = str(fa["caller_nid"])
         source_file = str(fa.get("source_file", ""))
         from_file = _file(caller) or source_file.replace("\\", "/")
-        owner = _eval(fa["rust_receiver"], from_file)
+        receiver = fa["rust_receiver"]
+        variant = receiver.get("variant") if isinstance(receiver, dict) else None
+        owner = _eval(receiver.get("of") if variant else receiver, from_file)
         if owner is None:
             continue
         decl = _pick([d for d in declared_by_type.get(owner[0], []) if _same(_file(d), owner[1])],
                      from_file)
+        if decl and variant:
+            decl = variants_of.get((decl, str(variant)))
         field_nid = fields_of.get((decl, str(fa["field"]))) if decl else None
         relation = "writes" if fa.get("access") == "writes" else "reads"
-        if field_nid is None or (caller, field_nid, relation) in seen:
+        if field_nid is None:
             continue
-        seen.add((caller, field_nid, relation))
-        all_edges.append({
+        existing = by_pair.get((caller, field_nid))
+        if existing is not None:
+            if existing["relation"] == relation:
+                continue
+            if relation == "reads":
+                existing.setdefault("also_reads", fa.get("source_location"))
+            else:  # a write after a read: the edge becomes the write
+                existing["also_reads"] = existing.get("source_location")
+                existing.update(relation="writes", context=str(fa.get("context") or relation),
+                                source_location=fa.get("source_location"))
+            continue
+        by_pair[(caller, field_nid)] = edge = {
             "source": caller,
             "target": field_nid,
             "relation": relation,
@@ -7592,7 +7625,8 @@ def _resolve_rust_field_accesses(accesses, all_nodes, all_edges, _eval, _file, _
             "source_file": source_file,
             "source_location": fa.get("source_location"),
             "weight": 1.0,
-        })
+        }
+        all_edges.append(edge)
 
 
 def _resolve_elixir_import_targets(

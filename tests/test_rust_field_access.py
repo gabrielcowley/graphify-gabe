@@ -162,3 +162,93 @@ def test_an_untyped_receiver_adds_no_edge(tmp_path: Path):
         ),
     })
     assert not any(f == "any()" for f, _t, _l in _uses(r, "reads"))
+
+
+_ROSTER = (
+    "use crate::battle::{Battle, Refusal};\n"                                  # 1
+    "use std::collections::HashMap;\n"                                         # 2
+    "pub struct Roster {\n"                                                    # 3
+    "    battles: Vec<Battle>,\n"                                              # 4
+    "    current: Option<Battle>,\n"                                           # 5
+    "    by_name: HashMap<String, Battle>,\n"                                  # 6
+    "}\n"                                                                      # 7
+    "impl Roster {\n"                                                          # 8
+    "    pub fn finished(&self) -> usize {\n"                                  # 9
+    "        self.battles.iter().filter(|b| b.finish_turn).count()\n"          # 10
+    "    }\n"                                                                  # 11
+    "    pub fn reset(&mut self) {\n"                                          # 12
+    "        for b in &mut self.battles {\n"                                   # 13
+    "            b.turns = 0;\n"                                               # 14
+    "        }\n"                                                              # 15
+    "    }\n"                                                                  # 16
+    "    pub fn current_done(&self) -> bool {\n"                               # 17
+    "        self.current.as_ref().is_some_and(|b| b.finish_turn)\n"           # 18
+    "    }\n"                                                                  # 19
+    "    pub fn sorted(&mut self) {\n"                                         # 20
+    "        self.battles.sort_by(|a, b| a.turns.cmp(&b.turns));\n"            # 21
+    "    }\n"                                                                  # 22
+    "    pub fn first_turns(&self) -> u32 {\n"                                 # 23
+    "        self.battles.first().map(|b| b.turns).unwrap_or(0)\n"             # 24
+    "    }\n"                                                                  # 25
+    "    pub fn named(&self) -> usize {\n"                                     # 26
+    "        self.by_name.iter().filter(|b| b.finish_turn).count()\n"          # 27
+    "    }\n"                                                                  # 28
+    "    pub fn total(&self) -> u32 {\n"                                       # 29
+    "        self.battles.iter().fold(0, |acc, b| acc + b.turns)\n"            # 30
+    "    }\n"                                                                  # 31
+    "    pub fn indexed(&self) {\n"                                            # 32
+    "        for (i, b) in self.battles.iter().enumerate() { let _ = (i, b.turns); }\n"  # 33
+    "    }\n"                                                                  # 34
+    "}\n"                                                                      # 35
+    "pub fn refuse(r: Refusal) -> u32 {\n"                                     # 36
+    "    match r { Refusal::UnmodelledWrite { what } => what }\n"              # 37
+    "}\n"                                                                      # 38
+    "pub fn make() -> Refusal { Refusal::UnmodelledWrite { what: 3 } }\n"      # 39
+    "pub fn destructure(b: Battle) -> bool {\n"                                # 40
+    "    let Battle { finish_turn, .. } = b;\n"                                # 41
+    "    finish_turn\n"                                                        # 42
+    "}\n"                                                                      # 43
+    "pub fn tick_twice(b: &mut Battle) { b.turns = b.turns + 1; }\n"           # 44
+)
+
+
+def _roster(tmp_path: Path) -> dict:
+    return _extract(tmp_path, {"src/lib.rs": "mod battle;\nmod roster;\n",
+                               "src/battle.rs": _BATTLE, "src/roster.rs": _ROSTER})
+
+
+def test_a_closure_parameter_holds_its_receivers_element(tmp_path: Path):
+    reads = _uses(_roster(tmp_path), "reads")
+    assert (".finished()", "Battle.finish_turn", "L10") in reads       # Vec -> iter -> filter
+    assert (".current_done()", "Battle.finish_turn", "L18") in reads   # Option -> is_some_and
+    assert (".sorted()", "Battle.turns", "L21") in reads               # both of sort_by's
+    assert (".first_turns()", "Battle.turns", "L24") in reads          # first() -> map
+
+
+def test_a_for_loop_variable_holds_its_iterables_element(tmp_path: Path):
+    assert (".reset()", "Battle.turns", "L14") in _uses(_roster(tmp_path), "writes")
+
+
+def test_what_cannot_be_typed_stays_out(tmp_path: Path):
+    # Each still reads its own `self.` field; what it cannot type is the element.
+    element_reads = {(f, t) for f, t, _l in _uses(_roster(tmp_path), "reads") if t.startswith("Battle.")}
+    assert (".named()", "Battle.finish_turn") not in element_reads  # a map's iter() yields pairs
+    assert (".total()", "Battle.turns") not in element_reads        # fold's first parameter is its accumulator
+    assert (".indexed()", "Battle.turns") not in element_reads      # a tuple pattern
+
+
+def test_variant_fields_are_written_by_literals_and_read_by_patterns(tmp_path: Path):
+    r = _roster(tmp_path)
+    assert ("make()", "UnmodelledWrite.what", "L39") in _uses(r, "writes")
+    assert ("refuse()", "UnmodelledWrite.what", "L37") in _uses(r, "reads")
+    assert ("destructure()", "Battle.finish_turn", "L41") in _uses(r, "reads")  # a struct pattern
+
+
+def test_a_function_that_reads_and_writes_a_field_keeps_both(tmp_path: Path):
+    # The graph keeps one edge per pair: the write carries the read's line.
+    r = _roster(tmp_path)
+    nodes = {n["id"]: n for n in r["nodes"]}
+    edge = next(e for e in r["edges"] if e["relation"] in ("reads", "writes")
+                and nodes[e["source"]]["label"] == "tick_twice()"
+                and nodes[e["target"]]["label"] == "Battle.turns")
+    assert edge["relation"] == "writes" and edge["also_reads"] == "L44"
