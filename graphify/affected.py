@@ -172,20 +172,35 @@ def _prefer_file_node(
 
 
 def resolve_seed(graph: nx.Graph, query: str, root: Path | None = None) -> str | None:
+    return resolve_seed_with_candidates(graph, query, root)[0]
+
+
+def resolve_seed_with_candidates(
+    graph: nx.Graph, query: str, root: Path | None = None
+) -> tuple[str | None, int]:
+    """`(seed, 0)` when *query* resolves, else `(None, n)`: n is the most nodes any
+    match pass found, so 0 is a miss and two or more is a tie no pass could break."""
+    widest = 0
+
+    def unique(matches: list[str]) -> bool:
+        nonlocal widest
+        widest = max(widest, len(matches))
+        return len(matches) == 1
+
     # A trailing path separator must not change a source-file match — serve's
     # _find_node tokenizes the path (which drops it), so strip it here for parity
     # (otherwise `affected "src/x.ts/"` returned None while `explain` resolved it).
     query = query.rstrip("/\\") or query
     if query in graph:
-        return query
+        return query, 0
     query_lower = _normalize_label(query)
     exact_label_matches = [
         str(node_id)
         for node_id, data in graph.nodes(data=True)
         if _normalize_label(str(data.get("label", ""))) == query_lower
     ]
-    if len(exact_label_matches) == 1:
-        return exact_label_matches[0]
+    if unique(exact_label_matches):
+        return exact_label_matches[0], 0
     # Callable labels are decorated ("name()"), so a bare "name" query falls
     # through exact matching and then ties with any "name*" sibling in the
     # contains pass. Match on the undecorated name before giving up.
@@ -195,8 +210,8 @@ def resolve_seed(graph: nx.Graph, query: str, root: Path | None = None) -> str |
         for node_id, data in graph.nodes(data=True)
         if _bare_name(str(data.get("label", ""))) == query_bare
     ]
-    if len(bare_name_matches) == 1:
-        return bare_name_matches[0]
+    if unique(bare_name_matches):
+        return bare_name_matches[0], 0
     # Compare paths in repo-relative form. Only this branch is path-shaped; the
     # label branches above keep the query verbatim.
     query_path = _normalize_label(_as_repo_relative(query, root))
@@ -205,22 +220,22 @@ def resolve_seed(graph: nx.Graph, query: str, root: Path | None = None) -> str |
         for node_id, data in graph.nodes(data=True)
         if _normalize_label(str(data.get("source_file", ""))) in (query_lower, query_path)
     ]
-    if len(exact_source_matches) == 1:
-        return exact_source_matches[0]
+    if unique(exact_source_matches):
+        return exact_source_matches[0], 0
     if exact_source_matches:
         preferred_file_node = _prefer_file_node(
             graph, exact_source_matches, _as_repo_relative(query, root)
         )
         if preferred_file_node is not None:
-            return preferred_file_node
+            return preferred_file_node, 0
     contains_matches = [
         str(node_id)
         for node_id, data in graph.nodes(data=True)
         if query_lower in _normalize_label(str(data.get("label", "")))
     ]
-    if len(contains_matches) == 1:
-        return contains_matches[0]
-    return None
+    if unique(contains_matches):
+        return contains_matches[0], 0
+    return None, widest
 
 
 def _supertypes(graph: nx.DiGraph, type_id: str, cache: dict[str, list[str]]) -> list[str]:

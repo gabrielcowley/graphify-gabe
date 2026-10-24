@@ -169,3 +169,31 @@ def test_query_substring_keyword_still_searches_not_refused(monkeypatch, tmp_pat
     assert code != EXIT_AMBIGUOUS
     assert "Ambiguous:" not in out
     assert "Client" in out  # it actually searched and surfaced a client node
+
+
+def _logged(monkeypatch, capsys, tmp_path, *argv):
+    log = tmp_path / "queries.log"
+    monkeypatch.setenv("GRAPHIFY_QUERY_LOG", str(log))
+    _run(monkeypatch, capsys, *argv, "--graph", str(_write_graph(tmp_path)))
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(records) == 1
+    return records[0]
+
+
+@pytest.mark.parametrize("argv, outcome", [
+    (("explain", "run()"), {"outcome": "found"}),
+    (("explain", ".nonce()"), {"outcome": "ambiguous", "candidates": 2}),
+    (("explain", "NoSuchSymbolXyz"), {"outcome": "not_found"}),
+    (("path", "run()", "src/b.ts::.nonce()"), {"outcome": "found"}),
+    (("path", "run()", ".nonce()"), {"outcome": "ambiguous", "candidates": 2, "endpoint": ".nonce()"}),
+    (("path", "run()", "island()"), {"outcome": "no_path"}),
+    (("affected", "BetaClient"), {"outcome": "found"}),
+    (("affected", ".nonce()"), {"outcome": "ambiguous", "candidates": 2}),
+    (("affected", "NoSuchSymbolXyz"), {"outcome": "not_found"}),
+])
+def test_every_lookup_logs_its_outcome(monkeypatch, tmp_path, capsys, argv, outcome):
+    # A miss or a tie exits before an answer is printed, and used to leave no
+    # record: the log held hits alone.
+    record = _logged(monkeypatch, capsys, tmp_path, *argv)
+    assert record["kind"] == argv[0]
+    assert {k: record.get(k) for k in outcome} == outcome
