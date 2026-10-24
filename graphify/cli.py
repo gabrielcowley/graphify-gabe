@@ -90,6 +90,31 @@ _DEFAULT_NUDGE_GRAPH = "graphify-out/graph.json"
 EXIT_AMBIGUOUS = 3
 EXIT_NOT_FOUND = 4
 
+_CANDIDATES_RE = re.compile(r"matches (\d+) nodes")
+
+
+def _lookup_outcome(refusal: str | None) -> dict:
+    """Query-log fields for how a lookup's name resolved: `found` (no refusal),
+    `ambiguous` with the candidate count, or `not_found`. Logged with every
+    lookup, so the log counts misses as well as hits."""
+    from graphify.serve import _is_ambiguity_refusal
+
+    if refusal is None:
+        return {"outcome": "found"}
+    if _is_ambiguity_refusal(refusal):
+        m = _CANDIDATES_RE.search(refusal)
+        return {"outcome": "ambiguous", "candidates": int(m.group(1)) if m else None}
+    return {"outcome": "not_found"}
+
+
+def _log_path_lookup(gp: Path, **fields) -> None:
+    """Log a `path` lookup with its outcome: `found`, `no_path` when both ends
+    resolved but nothing joins them, or the refused end's `ambiguous` or
+    `not_found` (with that end as `endpoint`)."""
+    from graphify import querylog
+    querylog.log_query(kind="path", question=f"{sys.argv[2]} -> {sys.argv[3]}",
+                       corpus=str(gp), **fields)
+
 
 def _nudge_for_out(nudge: str) -> str:
     """Name the effective graph.json in a hook-guard reminder (#4040).
@@ -1679,6 +1704,7 @@ def dispatch_command(cmd: str) -> None:
             # Same root derivation as `affected` (#2706): <root>/graphify-out/graph.json.
             seed_root=_graph_root_for(gp),
         )
+        _missed = _result == _QUERY_NO_MATCH or _result.startswith("No unique node match for --seed:")
         querylog.log_query(
             kind="query",
             question=question,
@@ -1689,12 +1715,13 @@ def dispatch_command(cmd: str) -> None:
             token_budget=budget,
             duration_ms=(_time.perf_counter() - _t0) * 1000,
             seeds=seeds or None,
+            **_lookup_outcome(_result if _missed or _is_ambiguity_refusal(_result) else None),
         )
         _touch_query_stamp(gp)
         print(_result)
         if _is_ambiguity_refusal(_result):
             sys.exit(EXIT_AMBIGUOUS)
-        if _result == _QUERY_NO_MATCH or _result.startswith("No unique node match for --seed:"):
+        if _missed:
             sys.exit(EXIT_NOT_FOUND)
     elif cmd == "affected":
         if len(sys.argv) < 3:
@@ -1755,15 +1782,24 @@ def dispatch_command(cmd: str) -> None:
         # --graph falls back to its own directory.
         from graphify.paths import GRAPHIFY_OUT_NAME
         graph_root = gp.parent.parent if gp.parent.name == GRAPHIFY_OUT_NAME else gp.parent
-        print(
-            format_affected(
-                graph,
-                query,
-                relations=relations or DEFAULT_AFFECTED_RELATIONS,
-                depth=depth,
-                root=graph_root,
-            )
+        _result = format_affected(
+            graph,
+            query,
+            relations=relations or DEFAULT_AFFECTED_RELATIONS,
+            depth=depth,
+            root=graph_root,
         )
+        print(_result)
+        from graphify import querylog
+        if _result.startswith("No unique node match for "):
+            from graphify.affected import resolve_seed_with_candidates
+            _widest = resolve_seed_with_candidates(graph, query, graph_root)[1]
+            _outcome = ({"outcome": "ambiguous", "candidates": _widest} if _widest > 1
+                        else {"outcome": "not_found"})
+        else:
+            _outcome = {"outcome": "found",
+                        "nodes_returned": sum(1 for ln in _result.splitlines() if ln.startswith("- "))}
+        querylog.log_query(kind="affected", question=query, corpus=str(gp), depth=depth, **_outcome)
     elif cmd in ("god-nodes", "god_nodes"):
         # god_nodes has long been an analyzer (analyze.py), an MCP tool, and a
         # README-advertised capability, but never a CLI subcommand — `graphify
@@ -1988,12 +2024,15 @@ def dispatch_command(cmd: str) -> None:
             (target_label, tgt_nid, tgt_err),
         ):
             if _err or _nid is None:
-                print(_err or f"No node matching '{_label}' found.", file=sys.stderr)
+                _err = _err or f"No node matching '{_label}' found."
+                _log_path_lookup(gp, endpoint=_label, **_lookup_outcome(_err))
+                print(_err, file=sys.stderr)
                 sys.exit(EXIT_AMBIGUOUS if _is_ambiguity_refusal(_err) else EXIT_NOT_FOUND)
         # Ambiguity guard: when both queries resolve to the same node, the
         # shortest path is trivially zero hops, which is almost never what the
         # caller wanted (see bug #828).
         if src_nid == tgt_nid:
+            _log_path_lookup(gp, outcome="ambiguous", candidates=1)
             print(
                 f"'{source_label}' and '{target_label}' both resolved to the same "
                 f"node '{src_nid}'. Use a more specific label or the exact node ID.",
@@ -2059,6 +2098,7 @@ def dispatch_command(cmd: str) -> None:
                     f"'{target_label}'. Re-run with --undirected to search "
                     "ignoring edge direction."
                 )
+            _log_path_lookup(gp, outcome="no_path")
             sys.exit(0)
         hops = len(path_nodes) - 1
         segments = []
@@ -2093,13 +2133,7 @@ def dispatch_command(cmd: str) -> None:
             else:
                 segments.append(f"<--{rel}{conf_str}-- {G.nodes[v].get('label', v)}")
         print(f"Shortest path ({hops} hops):\n  " + " ".join(segments))
-        from graphify import querylog
-        querylog.log_query(
-            kind="path",
-            question=f"{sys.argv[2]} -> {sys.argv[3]}",
-            corpus=str(gp),
-            nodes_returned=hops,
-        )
+        _log_path_lookup(gp, nodes_returned=hops, outcome="found")
         _touch_query_stamp(gp)
 
     elif cmd == "explain":
@@ -2132,6 +2166,9 @@ def dispatch_command(cmd: str) -> None:
             G = json_graph.node_link_graph(_raw)
         nid, refusal = _resolve_single_node(G, label)
         if nid is None:
+            from graphify import querylog
+            querylog.log_query(kind="explain", question=label, corpus=str(gp),
+                               **_lookup_outcome(refusal))
             print(refusal)
             sys.exit(EXIT_AMBIGUOUS if _is_ambiguity_refusal(refusal) else EXIT_NOT_FOUND)
         d = G.nodes[nid]
@@ -2226,6 +2263,7 @@ def dispatch_command(cmd: str) -> None:
             question=sys.argv[2],
             corpus=str(gp),
             nodes_returned=len(connections),
+            outcome="found",
         )
         _touch_query_stamp(gp)
 
