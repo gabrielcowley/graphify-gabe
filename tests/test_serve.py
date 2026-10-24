@@ -527,6 +527,36 @@ def test_a_miss_sharing_no_word_prints_what_it_did():
     assert _resolve_single_node(G, "zebra_quokka") == (None, "No node matching 'zebra_quokka' found.")
 
 
+def _field_graph() -> nx.Graph:
+    G = _make_big_graph()
+    G.add_node("game_owed", label="Game.overrun_frames_owed", _rust_field="overrun_frames_owed",
+               source_file="src/game.rs", source_location="L306")
+    G.add_node("battle_ft", label="Battle.finish_turn", _rust_field="finish_turn",
+               source_file="src/battle.rs", source_location="L941")
+    G.add_node("catch_ft", label=".finish_turn()", source_file="src/catch.rs", source_location="L231")
+    return G
+
+
+def test_a_fields_bare_name_resolves_to_it():
+    # Code names a field bare; its label is `Type.field`.
+    assert _resolve_single_node(_field_graph(), "overrun_frames_owed") == ("game_owed", None)
+
+
+def test_a_fields_bare_name_ties_with_a_same_named_method():
+    nid, msg = _resolve_single_node(_field_graph(), "finish_turn")
+    assert nid is None
+    assert msg.startswith("Ambiguous: 'finish_turn' matches 2 nodes in different files.")
+    assert _resolve_single_node(_field_graph(), "src/battle.rs::finish_turn") == ("battle_ft", None)
+
+
+def test_field_names_tier_alike_through_the_index_and_the_scan():
+    G = _field_graph()
+    for q in ("overrun_frames_owed", "finish_turn", "Battle.finish_turn", "frames_owed"):
+        full = _find_node_tiers(_field_graph(), q)
+        fast = _find_node_tiers(G, q, winning_tier_only=True)
+        assert fast == ((full[0], full[1], [], []) if full[0] or full[1] else full), q
+
+
 def test_strip_diacritics_leaves_ascii_alone_and_folds_the_rest():
     assert _strip_diacritics("Foo.Bar:Baz") == "Foo.Bar:Baz"
     assert _strip_diacritics("Café") == "Cafe"

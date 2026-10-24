@@ -493,6 +493,18 @@ def _get_trigram_index(G: nx.Graph) -> dict:
     return idx
 
 
+def _field_name_keys(d: dict) -> tuple[str, str] | None:
+    """A field node's bare name as the exact tiers compare it: (tokenized,
+    punctuated). A field is labelled `Type.field` (extractors/rust.py marks it
+    `_rust_field`), but code names it bare, so `overrun_frames_owed` is an exact
+    match for `Game.overrun_frames_owed` as `finish_turn` is for
+    `finish_turn()`. None for any other node."""
+    field = d.get("_rust_field")
+    if not isinstance(field, str) or not field:
+        return None
+    return " ".join(_search_tokens(field)), _strip_diacritics(field).lower()
+
+
 def _get_exact_index(G: nx.Graph) -> dict:
     """Lazily build and cache the maps that answer `_find_node_tiers`' exact tiers.
 
@@ -525,8 +537,14 @@ def _get_exact_index(G: nx.Graph) -> dict:
         source_tokens = source_tokens_cache.get(source)
         if source_tokens is None:
             source_tokens = source_tokens_cache[source] = " ".join(_search_tokens(source))
-        add(by_term, {norm_label, bare_label, label_tokens, nid_lower}, i)
-        add(by_norm, {norm_label, bare_label, nid_norm}, i)
+        term_keys = {norm_label, bare_label, label_tokens, nid_lower}
+        norm_keys = {norm_label, bare_label, nid_norm}
+        field_keys = _field_name_keys(d)
+        if field_keys:
+            term_keys.add(field_keys[0])
+            norm_keys.add(field_keys[1])
+        add(by_term, term_keys, i)
+        add(by_norm, norm_keys, i)
         add(by_source, {source_tokens}, i)
     idx = {"ids": list(G.nodes()), "by_term": by_term, "by_norm": by_norm, "by_source": by_source}
     G.graph["_exact_index"] = idx
@@ -1642,10 +1660,13 @@ def _resolve_path_scoped_symbol(G: nx.Graph, path_part: str, symbol_part: str) -
         bare_label = norm_label.rstrip("()")
         label_tokens = " ".join(_search_tokens(d.get("label") or ""))
         nid_lower = nid.lower()
+        field_keys = _field_name_keys(d)
         if (
             symbol_term == norm_label or symbol_term == bare_label
             or symbol_term == label_tokens or symbol_term == nid_lower
             or norm_symbol_query == norm_label or norm_symbol_query == bare_label
+            or (field_keys is not None
+                and (symbol_term == field_keys[0] or norm_symbol_query == field_keys[1]))
         ):
             matches.append(nid)
     return matches
@@ -1768,11 +1789,13 @@ def _find_node_tiers(
         # `_strip_diacritics` is the identity on ASCII, so the NFKD fold is only
         # paid for ids that actually carry non-ASCII text.
         nid_norm = nid_lower if nid.isascii() else _strip_diacritics(nid).lower()
+        field_keys = _field_name_keys(d)
         if term == source_tokens:
             source_exact.append(nid)
         elif (
             term == norm_label or term == bare_label or term == label_tokens or term == nid_lower
             or norm_query == norm_label or norm_query == bare_label or norm_query == nid_norm
+            or (field_keys is not None and (term == field_keys[0] or norm_query == field_keys[1]))
         ):
             exact.append(nid)
         elif (
