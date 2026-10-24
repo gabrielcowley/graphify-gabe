@@ -2354,6 +2354,102 @@ def _lexical_call_target(
         cls = method_owner.get(outer, outer) if outer else None
     return label_to_nid.get(callee)
 
+_C_WRAPPING_DECLARATORS = frozenset({
+    "init_declarator", "pointer_declarator", "array_declarator",
+    "parenthesized_declarator", "attributed_declarator", "function_declarator",
+})
+
+
+def _c_declared_name(declarator, source: bytes) -> str | None:
+    """The variable a C declarator declares, through `*`, `[]`, parentheses and
+    a function-pointer declarator (`void (*cb)(void)` declares `cb`). A plain
+    prototype (`void f(void);`) declares no variable, so it is None."""
+    node = declarator
+    while node is not None:
+        if node.type == "identifier":
+            return _read_text(node, source)
+        if node.type not in _C_WRAPPING_DECLARATORS:
+            return None
+        inner = node.child_by_field_name("declarator")
+        if inner is None and node.type in ("parenthesized_declarator", "attributed_declarator"):
+            # `(*sTable[])` has its declarator as a child, not a field
+            inner = next((c for c in node.named_children
+                          if c.type == "identifier" or c.type in _C_WRAPPING_DECLARATORS), None)
+        if node.type == "function_declarator" and inner is not None and inner.type == "identifier":
+            return None
+        node = inner
+    return None
+
+
+def _c_local_bound_names(func_def_node, source: bytes) -> set[str]:
+    """Parameters and locals of a C function, for the by-name reference guard: a
+    local `TaskFunc func` passed on as `CreateTask(func, 0)` is the local, not a
+    function named `func` elsewhere."""
+    bound: set[str] = set()
+    stack = [func_def_node]
+    while stack:
+        n = stack.pop()
+        if n.type in ("parameter_declaration", "declaration"):
+            for d in n.children_by_field_name("declarator"):
+                name = _c_declared_name(d, source)
+                if name:
+                    bound.add(name)
+        stack.extend(n.children)
+    return bound
+
+
+def _c_ref_value_idents(node, source: bytes):
+    """Identifiers a C expression yields as a value: a bare name, through
+    parentheses, a cast, `&`, either arm of `?:`, and an initializer list's
+    elements and designated values (`[OP] = Handler`). A name called, indexed,
+    or read through `->`/`.` is not a value of its own and is not yielded."""
+    if node is None:
+        return
+    t = node.type
+    if t == "identifier":
+        yield node
+    elif t in ("parenthesized_expression", "initializer_list"):
+        for c in node.named_children:
+            yield from _c_ref_value_idents(c, source)
+    elif t == "cast_expression":
+        yield from _c_ref_value_idents(node.child_by_field_name("value"), source)
+    elif t == "pointer_expression":
+        op = node.child_by_field_name("operator")
+        if op is not None and _read_text(op, source) == "&":
+            yield from _c_ref_value_idents(node.child_by_field_name("argument"), source)
+    elif t == "conditional_expression":
+        yield from _c_ref_value_idents(node.child_by_field_name("consequence"), source)
+        yield from _c_ref_value_idents(node.child_by_field_name("alternative"), source)
+    elif t == "initializer_pair":
+        yield from _c_ref_value_idents(node.child_by_field_name("value"), source)
+
+
+def _c_value_sites(node, source: bytes):
+    """Where a C function names another as a value, with the context for its
+    edge: an assignment's right side (`gTasks[id].func = Task_X`), an
+    initializer (`TaskFunc f = Task_X`, a table), a call's argument
+    (`CreateTask(Task_X, 0)`), a `return`, and an `==`/`!=` operand
+    (`if (gMain.callback2 == CB2_X)`)."""
+    t = node.type
+    if t == "assignment_expression":
+        yield node.child_by_field_name("right"), "assignment"
+    elif t == "init_declarator":
+        value = node.child_by_field_name("value")
+        yield value, "collection" if value is not None and value.type == "initializer_list" else "assignment"
+    elif t == "call_expression":
+        args = node.child_by_field_name("arguments")
+        if args is not None:
+            for arg in args.named_children:
+                yield arg, "argument"
+    elif t == "return_statement":
+        yield next((c for c in node.named_children), None), "return"
+    elif t == "binary_expression":
+        op = node.child_by_field_name("operator")
+        if op is not None and _read_text(op, source) in ("==", "!="):
+            yield node.child_by_field_name("left"), "comparison"
+            yield node.child_by_field_name("right"), "comparison"
+
+
 def _python_local_bound_names(func_def_node, source: bytes) -> set[str]:
     """Names bound LOCALLY inside a Python function: parameters plus assignment,
     `for`, `with ... as`, and comprehension targets.
@@ -7903,6 +7999,8 @@ def _extract_generic(
                 local_bound_names[func_nid] = _python_local_bound_names(node, source)
             elif config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
                 local_bound_names[func_nid] = _js_local_bound_names(node, source)
+            elif config.ts_module == "tree_sitter_c":
+                local_bound_names[func_nid] = _c_local_bound_names(node, source)
 
             if config.ts_module == "tree_sitter_python":
                 params_node = node.child_by_field_name("parameters")
@@ -10173,6 +10271,16 @@ def _extract_generic(
             for ident in _js_dispatch_value_idents(node):
                 _emit_indirect_ref(ident, caller_nid, enclosing_locals, "collection")
 
+        # C function pointers: a function named as a value in a body (assigned to
+        # a callback, passed to CreateTask, listed in a local table, returned or
+        # compared) is an indirect dependency of the function naming it, through
+        # the same shadow and callable-target guards.
+        if config.ts_module == "tree_sitter_c":
+            enclosing_locals = local_bound_names.get(caller_nid, frozenset()) | extra_locals
+            for value, context in _c_value_sites(node, source):
+                for ident in _c_ref_value_idents(value, source):
+                    _emit_indirect_ref(ident, caller_nid, enclosing_locals, context)
+
         # Assignment / return references (#1566 slice 2): a function bound to a name
         # (cb = handler) or returned from a factory (return handler) is an indirect
         # dependency of the enclosing function. The VALUE side only -- the assignment
@@ -10394,6 +10502,44 @@ def _extract_generic(
                 _scan_js_module_dispatch(c)
 
         _scan_js_module_dispatch(root)
+    elif config.ts_module == "tree_sitter_c":
+        # A function named in a file-level initializer: a command table
+        # (`gBattleScriptingCommandsTable[] = { Cmd_x, ... }`), a task list, a
+        # struct of callbacks. When it names a function of this file (defined or
+        # prototyped here), the variable becomes a node holding those edges: the
+        # graph keeps one edge per pair, so from the file node they would
+        # replace its `contains` edges. Otherwise the file node holds them.
+        c_prototypes: set[str] = set()
+        for top in root.named_children:
+            if top.type == "declaration":
+                for d in top.children_by_field_name("declarator"):
+                    inner = d.child_by_field_name("declarator") if d.type == "function_declarator" else None
+                    if inner is not None and inner.type == "identifier":
+                        c_prototypes.add(_read_text(inner, source))
+
+        def _scan_c_module_dispatch(n) -> None:
+            if n.type == "function_definition":
+                return  # bodies are walked separately
+            if n.type == "init_declarator":
+                idents = list(_c_ref_value_idents(n.child_by_field_name("value"), source))
+                scope = file_nid
+                name = _c_declared_name(n.child_by_field_name("declarator"), source)
+                if name and any(
+                    _read_text(i, source) in c_prototypes
+                    or label_to_nid.get(_read_text(i, source)) in callable_def_nids
+                    for i in idents
+                ):
+                    scope = _make_id(stem, name)
+                    line = n.start_point[0] + 1
+                    add_node(scope, name, line)
+                    add_edge(file_nid, scope, "contains", line)
+                for ident in idents:
+                    _emit_indirect_ref(ident, scope, frozenset(), "collection")
+                return
+            for c in n.children:
+                _scan_c_module_dispatch(c)
+
+        _scan_c_module_dispatch(root)
 
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids
