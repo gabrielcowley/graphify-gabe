@@ -107,6 +107,21 @@ def _lookup_outcome(refusal: str | None) -> dict:
     return {"outcome": "not_found"}
 
 
+def _warn_if_stale(gp: Path, G, built_at_commit, *, found=(), missed: bool = False) -> None:
+    """Say on stderr when the graph may not describe the checkout (see
+    graphify.staleness), so a miss mid-rebase is not read as an absent name.
+    *found* are the node ids the lookup answered with. Silent on a fresh graph."""
+    from graphify.staleness import staleness_note
+    note = staleness_note(
+        gp, built_at_commit if isinstance(built_at_commit, str) else None,
+        (str(d.get("source_file") or "") for _, d in G.nodes(data=True)),
+        found_files=[str(G.nodes[n].get("source_file") or "") for n in found if n in G],
+        missed=missed,
+    )
+    if note:
+        print(note, file=sys.stderr)
+
+
 def _log_path_lookup(gp: Path, **fields) -> None:
     """Log a `path` lookup with its outcome: `found`, `no_path` when both ends
     resolved but nothing joins them, or the refused end's `ambiguous` or
@@ -1705,6 +1720,7 @@ def dispatch_command(cmd: str) -> None:
             seed_root=_graph_root_for(gp),
         )
         _missed = _result == _QUERY_NO_MATCH or _result.startswith("No unique node match for --seed:")
+        _warn_if_stale(gp, G, _raw.get("built_at_commit"), missed=_missed)
         querylog.log_query(
             kind="query",
             question=question,
@@ -1789,11 +1805,13 @@ def dispatch_command(cmd: str) -> None:
             depth=depth,
             root=graph_root,
         )
+        from graphify.affected import resolve_seed_with_candidates
+        _seed, _widest = resolve_seed_with_candidates(graph, query, graph_root)
+        _warn_if_stale(gp, graph, graph.graph.get("_built_at_commit"),
+                       found=[_seed] if _seed else (), missed=_seed is None and _widest < 2)
         print(_result)
         from graphify import querylog
         if _result.startswith("No unique node match for "):
-            from graphify.affected import resolve_seed_with_candidates
-            _widest = resolve_seed_with_candidates(graph, query, graph_root)[1]
             _outcome = ({"outcome": "ambiguous", "candidates": _widest} if _widest > 1
                         else {"outcome": "not_found"})
         else:
@@ -2019,6 +2037,10 @@ def dispatch_command(cmd: str) -> None:
             G = json_graph.node_link_graph(_raw)
         src_nid, src_scored, src_err = _resolve_path_endpoint(G, source_label)
         tgt_nid, tgt_scored, tgt_err = _resolve_path_endpoint(G, target_label)
+        _warn_if_stale(gp, G, _raw.get("built_at_commit"),
+                       found=[n for n in (src_nid, tgt_nid) if n],
+                       missed=any(n is None and not _is_ambiguity_refusal(e)
+                                  for n, e in ((src_nid, src_err), (tgt_nid, tgt_err))))
         for _label, _nid, _err in (
             (source_label, src_nid, src_err),
             (target_label, tgt_nid, tgt_err),
@@ -2165,6 +2187,8 @@ def dispatch_command(cmd: str) -> None:
         except TypeError:
             G = json_graph.node_link_graph(_raw)
         nid, refusal = _resolve_single_node(G, label)
+        _warn_if_stale(gp, G, _raw.get("built_at_commit"), found=[nid] if nid else (),
+                       missed=nid is None and not _is_ambiguity_refusal(refusal))
         if nid is None:
             from graphify import querylog
             querylog.log_query(kind="explain", question=label, corpus=str(gp),

@@ -426,6 +426,11 @@ def load_graph(path: Path) -> nx.Graph:
     if "links" not in raw and "edges" in raw:
         raw = dict(raw, links=raw["edges"])
     try:
-        return json_graph.node_link_graph(raw, edges="links")
+        graph = json_graph.node_link_graph(raw, edges="links")
     except TypeError:
-        return json_graph.node_link_graph(raw)
+        graph = json_graph.node_link_graph(raw)
+    # node_link_graph drops top-level keys; keep the build commit, as serve does.
+    commit = raw.get("built_at_commit")
+    if isinstance(commit, str) and commit.strip():
+        graph.graph["_built_at_commit"] = commit.strip()
+    return graph
