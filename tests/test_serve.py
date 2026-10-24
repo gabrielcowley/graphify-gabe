@@ -22,6 +22,8 @@ from graphify.serve import (
     _bfs,
     _dfs,
     _find_node,
+    _find_node_tiers,
+    _resolve_single_node,
     _trigrams,
     _node_search_text,
     _get_trigram_index,
@@ -442,6 +444,57 @@ def test_trigram_index_cached_and_rebuilt_per_graph():
     assert G.graph["_trigram_index"] is idx1
     G2 = _make_big_graph()
     assert _get_trigram_index(G2) is not idx1       # a fresh graph rebuilds (reload safety)
+
+
+_TIER_QUERIES = [
+    "ZebraQuokkaWidget", "zebraquokkawidget", "Foo.Bar:Baz", "foo bar baz", "id7",
+    "item node 12", "pkg/item_3.py", "zoo/zqw.py", "Marmoset", "QuokkaWidget",
+    "item node", "no such thing", "zoo/zqw.py::ZebraQuokkaWidget",
+]
+
+
+def _full_scan_tiers(label: str):
+    # A fresh graph, so its first tier lookup scans every node: the reference.
+    return _find_node_tiers(_make_big_graph(), label)
+
+
+def test_winning_tier_only_matches_the_full_scan_winning_tier():
+    # The exact index must sort a hit into the tier, and the order, the scan does;
+    # below an exact hit nothing is computed, and without one all four tiers are.
+    G = _make_big_graph()
+    for q in _TIER_QUERIES:
+        full = _full_scan_tiers(q)
+        fast = _find_node_tiers(G, q, winning_tier_only=True)
+        if full[0] or full[1]:
+            assert fast == (full[0], full[1], [], []), q
+        else:
+            assert fast == full, q
+
+
+def test_tier_lookups_with_the_trigram_index_match_the_full_scan():
+    G = _make_big_graph()
+    _get_trigram_index(G)
+    for q in _TIER_QUERIES:
+        assert _find_node_tiers(G, q) == _full_scan_tiers(q), q
+
+
+def test_one_lookup_builds_no_trigram_index_and_a_second_does():
+    # A CLI call resolves one label: the trigram index would cost more to build
+    # than the scan it saves. A graph searched again (the MCP server's) builds it.
+    G = _make_big_graph()
+    assert _resolve_single_node(G, "ZebraQuokkaWidget") == ("rareA", None)
+    assert _resolve_single_node(G, "Marmoset")[0] == "rareB"   # prefix: scanned
+    assert "_trigram_index" not in G.graph
+    G = _make_big_graph()
+    _find_node_tiers(G, "Marmoset")
+    _find_node_tiers(G, "Quokka")
+    assert "_trigram_index" in G.graph
+
+
+def test_strip_diacritics_leaves_ascii_alone_and_folds_the_rest():
+    assert _strip_diacritics("Foo.Bar:Baz") == "Foo.Bar:Baz"
+    assert _strip_diacritics("Café") == "Cafe"
+    assert _strip_diacritics(None) == ""
 
 
 def test_query_terms_strips_search_punctuation():
