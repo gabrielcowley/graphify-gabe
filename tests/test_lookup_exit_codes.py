@@ -78,6 +78,16 @@ def test_explain_miss_exits_not_found(monkeypatch, tmp_path, capsys, label):
     assert f"No node matching '{label}' found." in out
 
 
+def test_explain_miss_with_suggestions_still_exits_not_found(monkeypatch, tmp_path, capsys):
+    # The suggestions follow the miss line; the exit code is still a miss, so a
+    # hook reading it does not take the listing for an answer.
+    code, out = _run(monkeypatch, capsys,
+        "explain", "AlphaClientFactory", "--graph", str(_write_graph(tmp_path)))
+    assert code == EXIT_NOT_FOUND
+    assert out.startswith("No node matching 'AlphaClientFactory' found. These names share words")
+    assert "  AlphaClient  src/a.ts L1" in out
+
+
 def test_path_answer_exits_zero(monkeypatch, tmp_path, capsys):
     code, out = _run(monkeypatch, capsys,
         "path", "run()", "src/b.ts::.nonce()", "--graph", str(_write_graph(tmp_path)))

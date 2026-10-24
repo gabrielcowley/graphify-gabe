@@ -24,6 +24,7 @@ from graphify.serve import (
     _find_node,
     _find_node_tiers,
     _resolve_single_node,
+    _shared_word_matches,
     _trigrams,
     _node_search_text,
     _get_trigram_index,
@@ -489,6 +490,41 @@ def test_one_lookup_builds_no_trigram_index_and_a_second_does():
     _find_node_tiers(G, "Marmoset")
     _find_node_tiers(G, "Quokka")
     assert "_trigram_index" in G.graph
+
+
+def _turn_graph() -> nx.Graph:
+    G = nx.Graph()
+    for nid, label in [
+        ("next", ".turn_next_action()"), ("script", ".turn_step_action_script()"),
+        ("run", ".handle_action_run()"), ("rt", "runtime_turn()"),
+        ("party", "PartyMenu"), ("other", "unrelated_helper()"),
+    ]:
+        G.add_node(nid, label=label, source_file="turn.rs", source_location="L1")
+    return G
+
+
+def test_a_miss_suggests_the_labels_that_share_most_words():
+    # The query's own spelling shares no substring with any label, but its words
+    # do: `actions` meets `action`, `turn` meets `turn`.
+    G = _turn_graph()
+    assert _shared_word_matches(G, "run_turn_actions()")[:3] == ["next", "run", "script"]
+    nid, msg = _resolve_single_node(G, "run_turn_actions()")
+    assert nid is None
+    assert msg.startswith("No node matching 'run_turn_actions()' found. These names share words")
+    assert "  .turn_next_action()  turn.rs L1" in msg
+
+
+def test_shared_words_split_camel_case_and_need_a_four_letter_stem():
+    G = _turn_graph()
+    assert _shared_word_matches(G, "RunTurnActions")[0] == "next"
+    assert _shared_word_matches(G, "party_menus") == ["party"]
+    # `run` is too short a stem to meet `runtime`.
+    assert "rt" not in _shared_word_matches(G, "run_quickly")
+
+
+def test_a_miss_sharing_no_word_prints_what_it_did():
+    G = _turn_graph()
+    assert _resolve_single_node(G, "zebra_quokka") == (None, "No node matching 'zebra_quokka' found.")
 
 
 def test_strip_diacritics_leaves_ascii_alone_and_folds_the_rest():
