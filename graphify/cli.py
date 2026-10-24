@@ -183,6 +183,9 @@ def _print_explain_brief(G, nid: str) -> int:
                 refs.append(entry)
             elif ed.get("relation") == "writes":
                 writes.append(entry)
+                if ed.get("also_reads"):  # the same function reads it too
+                    site_file = site.rpartition(":")[0] or site
+                    reads.append((f"{site_file}:{ed['also_reads']}", entry[1]))
             elif ed.get("relation") == "reads":
                 reads.append(entry)
 
@@ -4514,7 +4517,7 @@ def dispatch_command(cmd: str) -> None:
                             "_ts_public_twin", "_py_property", "_java_ret",
                             "_ts_fields", "_ts_static_fields",
                             "_py_fixture",
-                            "_rust_ret", "_rust_ret_ok", "_rust_fields", "_rust_field",
+                            "_rust_ret", "_rust_ret_ok", "_rust_fields", "_rust_field", "_rust_field_holds",
                         ):
                             if _node.get(_marker):
                                 _ctx_node[_marker] = _node[_marker]
@@ -4550,7 +4553,7 @@ def dispatch_command(cmd: str) -> None:
                         "links", _ctx_graph.get("edges", [])
                     ):
                         if _edge.get("relation") not in (
-                            "contains", "method", "inherits", "imports", "imports_from"
+                            "contains", "method", "inherits", "imports", "imports_from", "case_of"
                         ):
                             continue
                         if not _ctx_is_ast_tier(_edge):

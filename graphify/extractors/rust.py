@@ -349,6 +349,31 @@ _RUST_UNWRAP_METHODS = frozenset({"unwrap", "expect", "unwrap_or_default"})
 # still wins: the corpus pass falls back to `of` only when none binds.
 _RUST_WRAPPER_KEEPING_METHODS = frozenset({
     "filter", "as_mut", "as_ref", "as_deref", "as_deref_mut", "take", "inspect",
+    # An iterator over a container, an adapter of it, or one element of it
+    # (`Option<&T>`), holds the container's element.
+    "iter", "iter_mut", "into_iter", "drain", "rev", "skip", "step_by", "chain",
+    "cloned", "copied", "peekable", "fuse", "skip_while", "take_while",
+    "first", "last", "first_mut", "last_mut", "next", "next_back", "nth", "peek",
+    "find", "get", "get_mut", "max_by_key", "min_by_key", "max_by", "min_by",
+})
+# What `x` holds when a closure over it, a `for` over it, or `.first()` on it
+# sees `T`: the `Some`/`Ok` of an Option/Result, a collection's element.
+_RUST_ELEMENT_CONTAINERS = frozenset({
+    "Option", "Result", "Vec", "VecDeque", "HashSet", "BTreeSet", "BinaryHeap",
+    "LinkedList", "SmallVec", "ArrayVec",
+})
+# Methods that call their closure with each element (one parameter), or with two
+# (`sort_by(|a, b| ..)`), of what their receiver holds.
+_RUST_ELEMENT_CLOSURE_METHODS = frozenset({
+    "filter", "map", "for_each", "any", "all", "find", "position", "rposition",
+    "filter_map", "flat_map", "inspect", "take_while", "skip_while", "map_while",
+    "is_some_and", "is_ok_and", "is_none_or", "and_then", "map_or", "map_or_else",
+    "max_by_key", "min_by_key", "sort_by_key", "sort_unstable_by_key", "retain",
+    "retain_mut", "find_map", "partition", "group_by", "chunk_by", "dedup_by_key",
+    "sum_by", "count_by",
+})
+_RUST_PAIR_CLOSURE_METHODS = frozenset({
+    "sort_by", "sort_unstable_by", "max_by", "min_by", "dedup_by", "is_sorted_by",
 })
 # `if let Some(x) = e` / `Ok(x)`: the variants that hold `e`'s `Ok`/`Some` type.
 _RUST_HOLDING_VARIANTS = frozenset({"Some", "Ok"})
@@ -519,6 +544,35 @@ def _rust_named_type(type_node, source: bytes, self_type: str | None,
     return name
 
 
+def _rust_held_type(type_node, source: bytes, self_type: str | None,
+                    generics: frozenset[str]) -> str | None:
+    """The type a value of ``type_node`` holds: the `T` of `Option<T>`,
+    `Result<T, E>`, `Vec<T>` and the other `_RUST_ELEMENT_CONTAINERS`, `[T]`,
+    `[T; N]`, through references and `Box`/`Arc`/`Rc`. None for anything else
+    (a map, whose `iter()` yields pairs, among them)."""
+    t = type_node
+    while t is not None and t.type == "reference_type":
+        t = t.child_by_field_name("type")
+    if t is None:
+        return None
+    if t.type == "array_type":
+        element = t.child_by_field_name("element")
+        return _rust_named_type(element, source, self_type, generics) if element is not None else None
+    if t.type != "generic_type":
+        return None
+    base = t.child_by_field_name("type")
+    outer = _rust_type_last_segment(_read_text(base, source)) if base is not None else ""
+    args = t.child_by_field_name("type_arguments")
+    inner = [a for a in args.named_children if a.type != "lifetime"] if args is not None else []
+    if not inner:
+        return None
+    if outer in _RUST_DEREF_WRAPPERS:
+        return _rust_held_type(inner[0], source, self_type, generics)
+    if outer in _RUST_ELEMENT_CONTAINERS:
+        return _rust_named_type(inner[0], source, self_type, generics)
+    return None
+
+
 def _rust_crate_local_type(path_text: str) -> str:
     """`crate::a::Foo` / `self::Foo` / `super::Foo` -> `Foo`; any other path
     (`fs::DirEntry`, `walkdir::DirEntry`) may name another crate's type of the same
@@ -537,16 +591,12 @@ def _rust_return_types(fn_node, source: bytes, self_type: str | None) -> tuple[s
     if ret is None:
         return None, None
     generics = _rust_generic_names(fn_node, source)
-    t = ret
-    while t is not None and t.type == "reference_type":
-        t = t.child_by_field_name("type")
-    if t is not None and t.type == "generic_type":
-        outer = _rust_type_last_segment(_read_text(t.child_by_field_name("type"), source))
-        if outer in _RUST_FALLIBLE_WRAPPERS:
-            args = t.child_by_field_name("type_arguments")
-            inner = [a for a in args.named_children if a.type != "lifetime"] if args is not None else []
-            return None, (_rust_named_type(inner[0], source, self_type, generics) if inner else None)
-    return _rust_named_type(ret, source, self_type, generics), None
+    # A collection's element counts as what it holds, like an Option's `Some`: a
+    # closure over the result, a `for` over it or `.first()` of it sees that.
+    named = _rust_named_type(ret, source, self_type, generics)
+    if named in _RUST_ELEMENT_CONTAINERS:
+        named = None
+    return named, _rust_held_type(ret, source, self_type, generics)
 
 
 def _rust_binding_name(pattern):
@@ -605,9 +655,11 @@ class _RustReceiverTyper:
                     self._add_opaque(n.child_by_field_name("pattern"), n.end_byte, scope)
             elif n.type == "closure_expression":
                 cparams = n.child_by_field_name("parameters")
-                if cparams is not None:
+                if cparams is not None and not self._add_element_params(n, cparams):
                     self._add_params(cparams, n)
             elif n.type == "let_condition" and self._add_held(n):
+                pass
+            elif n.type == "for_expression" and self._add_for(n):
                 pass
             elif n.type in ("for_expression", "let_condition", "match_arm"):
                 # `for x in`, `if let Some(x) =`, `Ok(x) =>` bind names the
@@ -641,6 +693,58 @@ class _RustReceiverTyper:
         scope = n.parent if n.parent is not None else n
         self.bindings.setdefault(_read_text(name, self.source), []).append(
             (n.end_byte, scope.start_byte, scope.end_byte, None, value, True))
+        return True
+
+    def _held_names(self, patterns) -> list | None:
+        """The identifiers `x`, `mut x`, `&x` and `&&x` patterns bind, or None when
+        any pattern is another shape (a tuple, a struct)."""
+        names = []
+        for p in patterns:
+            while p is not None and p.type == "reference_pattern":
+                p = next(iter(p.named_children), None)
+            name = _rust_binding_name(p)
+            if name is None:
+                return None
+            names.append(name)
+        return names
+
+    def _add_element_params(self, closure, params) -> bool:
+        """`recv.filter(|x| ..)`, `opt.is_some_and(|b| ..)`, `v.sort_by(|a, b| ..)`:
+        an untyped parameter holds what `recv` holds, the element the method
+        calls the closure with. False for any other closure, which the caller
+        binds as before."""
+        args = closure.parent
+        call = args.parent if args is not None else None
+        if args is None or args.type != "arguments" or call is None or call.type != "call_expression":
+            return False
+        fn = call.child_by_field_name("function")
+        if fn is not None and fn.type == "generic_function":
+            fn = fn.child_by_field_name("function")
+        if fn is None or fn.type != "field_expression":
+            return False
+        method_node, recv = fn.child_by_field_name("field"), fn.child_by_field_name("value")
+        if method_node is None or recv is None:
+            return False
+        method = _read_text(method_node, self.source)
+        want = 1 if method in _RUST_ELEMENT_CLOSURE_METHODS else 2 if method in _RUST_PAIR_CLOSURE_METHODS else 0
+        patterns = list(params.named_children)
+        names = self._held_names(patterns) if want and len(patterns) == want else None
+        if not names:
+            return False
+        for name in names:
+            self.bindings.setdefault(_read_text(name, self.source), []).append(
+                (params.start_byte, closure.start_byte, closure.end_byte, None, recv, True))
+        return True
+
+    def _add_for(self, n) -> bool:
+        """`for x in e`: `x` holds what `e` holds (its element). False for a
+        pattern other than a name (`for (i, x) in ..`), bound as untyped."""
+        value = n.child_by_field_name("value")
+        names = self._held_names([n.child_by_field_name("pattern")])
+        if value is None or not names:
+            return False
+        self.bindings.setdefault(_read_text(names[0], self.source), []).append(
+            (value.end_byte, n.start_byte, n.end_byte, None, value, True))
         return True
 
     def _add_params(self, params, scope) -> None:
@@ -690,7 +794,10 @@ class _RustReceiverTyper:
                 return None
             if b[3] is not None:
                 named = _rust_named_type(b[3], src, self.self_type, self.generics)
-                return self._typed(named) if named else None
+                if named and named not in _RUST_ELEMENT_CONTAINERS:
+                    return self._typed(named)
+                held = _rust_held_type(b[3], src, self.self_type, self.generics)
+                return {"held": self._typed(held)} if held else None
             if len(b) > 5 and b[5]:
                 # bound by `if let Some(x) = ..`: the value is read where it is
                 # written, before `x` (which may shadow a name in it) is bound
@@ -1146,6 +1253,13 @@ def extract_rust(path: Path) -> dict:
                             if field_name is not None and field_type:
                                 declaration_node.setdefault("_rust_fields", {})[
                                     _read_text(field_name, source)] = field_type
+                            field_holds = (
+                                _rust_held_type(type_node, source, item_name, struct_generics)
+                                if type_node is not None else None
+                            )
+                            if field_name is not None and field_holds:
+                                declaration_node.setdefault("_rust_field_holds", {})[
+                                    _read_text(field_name, source)] = field_holds
                             if field_name is not None:
                                 add_field_node(item_nid, item_name, _read_text(field_name, source),
                                                field.start_point[0] + 1)
@@ -1510,7 +1624,7 @@ def extract_rust(path: Path) -> dict:
                              "writes" if writes else "reads", fld.start_point[0] + 1,
                              "assign" if writes else "read")
         elif node.type == "struct_expression":
-            receiver = typer.describe(node)
+            receiver = owner_of_struct_path(node.child_by_field_name("name"), typer) or typer.describe(node)
             body = node.child_by_field_name("body")
             if receiver is None or body is None:
                 return
@@ -1524,6 +1638,35 @@ def extract_rust(path: Path) -> dict:
                 if name is not None and name.type in ("field_identifier", "identifier"):
                     field_access(caller_nid, _read_text(name, source), receiver, "writes",
                                  init.start_point[0] + 1, "init")
+        elif node.type == "struct_pattern":
+            # `T { f, .. }` / `E::V { f: x }` takes `f` apart: a read of it.
+            receiver = owner_of_struct_path(node.child_by_field_name("type"), typer)
+            if receiver is None:
+                return
+            for fp in node.named_children:
+                if fp.type != "field_pattern":
+                    continue
+                name = fp.child_by_field_name("name")
+                if name is not None:
+                    field_access(caller_nid, _read_text(name, source), receiver, "reads",
+                                 fp.start_point[0] + 1, "match")
+
+    def owner_of_struct_path(type_node, typer: "_RustReceiverTyper") -> dict | None:
+        """Whose fields a struct literal or pattern names: `{"variant": V, "of":
+        {"t": E}}` for `E::V` / `Self::V`, `{"t": T}` for a struct `T` / `Self`.
+        None for a generic, a lowercase name or a path the typer cannot name."""
+        if type_node is None:
+            return None
+        segments = [seg for seg in _read_text(type_node, source).split("<")[0].split("::") if seg]
+        if not segments:
+            return None
+        segments = [typer.self_type if seg == "Self" else seg for seg in segments]
+        if not all(segments) or any(seg in typer.generics for seg in segments):
+            return None
+        last = segments[-1]
+        if len(segments) >= 2 and segments[-2][:1].isupper() and last[:1].isupper():
+            return {"variant": last, "of": typer._typed(segments[-2])}
+        return typer._typed(last) if last[:1].isupper() else None
 
     def reference(node, caller_nid: str, self_type: str | None, scope: tuple[str, ...]) -> None:
         # A variant or constant named as a value or in a pattern: `Err(E::Missing)`,
@@ -1599,7 +1742,7 @@ def extract_rust(path: Path) -> dict:
     ) -> None:
         if node.type in ("function_item", "use_declaration", "attribute_item"):
             return
-        if typer is not None and node.type in ("field_expression", "struct_expression"):
+        if typer is not None and node.type in ("field_expression", "struct_expression", "struct_pattern"):
             record_field_use(node, caller_nid, typer)
         if node.type in ("scoped_identifier", "identifier") or (
                 node.type == "scoped_type_identifier" and node.parent is not None
