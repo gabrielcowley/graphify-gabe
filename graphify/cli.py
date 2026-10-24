@@ -126,11 +126,11 @@ _CALL_RELATIONS = ("calls", "indirect_call")
 
 
 def _explain_rank(direction: str, relation: str) -> int:
-    """`explain`'s connection order: incoming calls, incoming references,
-    outgoing calls, then everything else."""
-    if direction == "in" and relation in _CALL_RELATIONS:
+    """`explain`'s connection order: incoming calls (and, for a field, writes),
+    incoming references (and reads), outgoing calls, then everything else."""
+    if direction == "in" and relation in (*_CALL_RELATIONS, "writes"):
         return 0
-    if direction == "in" and relation == "references":
+    if direction == "in" and relation in ("references", "reads"):
         return 1
     if direction == "out" and relation in _CALL_RELATIONS:
         return 2
@@ -158,13 +158,16 @@ def _is_own_file_contains(G, nid: str, direction: str, nb: str, edata: dict) -> 
 
 def _print_explain_brief(G, nid: str) -> int:
     """`explain --brief`: where the node is, then every caller and every
-    reference to it, one `file:line name` each and uncapped. Returns the count."""
+    reference to it (for a field, every writer and reader), one `file:line name`
+    each and uncapped. Returns the count."""
     d = G.nodes[nid]
     where = f"{d.get('source_file', '')} {d.get('source_location', '')}".strip()
     print(f"{d.get('label', nid)}  {where}".rstrip())
     from graphify.build import edge_data
     calls: list[tuple[str, str]] = []
     refs: list[tuple[str, str]] = []
+    writes: list[tuple[str, str]] = []
+    reads: list[tuple[str, str]] = []
     for nb in set(G.predecessors(nid)) | set(G.successors(nid)):
         for a, b in ((nb, nid), (nid, nb)):
             if not G.has_edge(a, b):
@@ -178,20 +181,26 @@ def _print_explain_brief(G, nid: str) -> int:
                 calls.append(entry)
             elif ed.get("relation") == "references":
                 refs.append(entry)
+            elif ed.get("relation") == "writes":
+                writes.append(entry)
+            elif ed.get("relation") == "reads":
+                reads.append(entry)
 
     def _key(entry: tuple[str, str]):
         path, _, line = entry[0].rpartition(":")
         digits = line.lstrip("L")
         return (path or entry[0], int(digits) if digits.isdigit() else 0, entry[1])
 
-    for title, entries in (("Called by", calls), ("Referenced by", refs)):
+    sections = (("Called by", calls), ("Written by", writes),
+                ("Read by", reads), ("Referenced by", refs))
+    for title, entries in sections:
         if entries:
             print(f"{title} ({len(entries)}):")
             for site, name in sorted(set(entries), key=_key):
                 print(f"  {site}  {name}")
-    if not calls and not refs:
+    if not any(entries for _title, entries in sections):
         print("No callers or references in the graph.")
-    return len(calls) + len(refs)
+    return sum(len(entries) for _title, entries in sections)
 
 
 def _log_path_lookup(gp: Path, **fields) -> None:
@@ -4505,7 +4514,7 @@ def dispatch_command(cmd: str) -> None:
                             "_ts_public_twin", "_py_property", "_java_ret",
                             "_ts_fields", "_ts_static_fields",
                             "_py_fixture",
-                            "_rust_ret", "_rust_ret_ok", "_rust_fields",
+                            "_rust_ret", "_rust_ret_ok", "_rust_fields", "_rust_field",
                         ):
                             if _node.get(_marker):
                                 _ctx_node[_marker] = _node[_marker]

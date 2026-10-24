@@ -1,8 +1,8 @@
 """Rust extractor. Moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
-
 import hashlib
+import json
 import re
 from pathlib import Path
 from graphify.extractors.base import (
@@ -344,6 +344,27 @@ _RUST_FALLIBLE_WRAPPERS = frozenset({"Result", "Option"})
 # Result/Option (`x.unwrap()`), so a chain through them keeps a known type.
 _RUST_SAME_TYPE_METHODS = frozenset({"clone", "to_owned"})
 _RUST_UNWRAP_METHODS = frozenset({"unwrap", "expect", "unwrap_or_default"})
+# On an `Option` or `Result` these return the same wrapper around the same type,
+# so `x.filter(..)` holds what `x` holds. A corpus type's own method of that name
+# still wins: the corpus pass falls back to `of` only when none binds.
+_RUST_WRAPPER_KEEPING_METHODS = frozenset({
+    "filter", "as_mut", "as_ref", "as_deref", "as_deref_mut", "take", "inspect",
+})
+# `if let Some(x) = e` / `Ok(x)`: the variants that hold `e`'s `Ok`/`Some` type.
+_RUST_HOLDING_VARIANTS = frozenset({"Some", "Ok"})
+
+
+def _rust_held_binding(pattern):
+    """The identifier `Some(x)` / `Ok(mut x)` binds, else None."""
+    if pattern is None or pattern.type != "tuple_struct_pattern":
+        return None
+    type_node = pattern.child_by_field_name("type")
+    if type_node is None or type_node.type != "identifier":
+        return None
+    inner = [c for c in pattern.named_children if c != type_node]
+    if len(inner) != 1:
+        return None
+    return inner[0], type_node
 
 
 def _rust_use_leaves(node, source: bytes, head: str | None):
@@ -586,6 +607,8 @@ class _RustReceiverTyper:
                 cparams = n.child_by_field_name("parameters")
                 if cparams is not None:
                     self._add_params(cparams, n)
+            elif n.type == "let_condition" and self._add_held(n):
+                pass
             elif n.type in ("for_expression", "let_condition", "match_arm"):
                 # `for x in`, `if let Some(x) =`, `Ok(x) =>` bind names the
                 # receiver lookup cannot type; they still hide an outer `x`, but
@@ -602,6 +625,23 @@ class _RustReceiverTyper:
                     scope, start = n, (pattern.end_byte if pattern is not None else n.start_byte)
                 self._add_opaque(pattern, start, scope)
             stack.extend(n.children)
+
+    def _add_held(self, n) -> bool:
+        """`if let Some(x) = e` / `while let Ok(x) = e`: `x` holds `e`'s `Some`/`Ok`
+        type, the way a `?` or `.unwrap()` on `e` does. False for any other shape,
+        which the caller binds as untyped."""
+        held = _rust_held_binding(n.child_by_field_name("pattern"))
+        value = n.child_by_field_name("value")
+        if held is None or value is None:
+            return False
+        inner, variant = held
+        name = _rust_binding_name(inner)
+        if name is None or _read_text(variant, self.source) not in _RUST_HOLDING_VARIANTS:
+            return False
+        scope = n.parent if n.parent is not None else n
+        self.bindings.setdefault(_read_text(name, self.source), []).append(
+            (n.end_byte, scope.start_byte, scope.end_byte, None, value, True))
+        return True
 
     def _add_params(self, params, scope) -> None:
         for p in params.named_children:
@@ -651,6 +691,11 @@ class _RustReceiverTyper:
             if b[3] is not None:
                 named = _rust_named_type(b[3], src, self.self_type, self.generics)
                 return self._typed(named) if named else None
+            if len(b) > 5 and b[5]:
+                # bound by `if let Some(x) = ..`: the value is read where it is
+                # written, before `x` (which may shadow a name in it) is bound
+                value = self.describe(b[4], b[4].start_byte, depth + 1)
+                return {"ok": value} if value is not None else None
             return self.describe(b[4], b[0], depth + 1)
         if t in ("reference_expression", "parenthesized_expression", "unary_expression", "await_expression"):
             inner = [c for c in node.named_children]
@@ -688,6 +733,8 @@ class _RustReceiverTyper:
                     return of
                 if method in _RUST_UNWRAP_METHODS:
                     return {"ok": of}
+                if method in _RUST_WRAPPER_KEEPING_METHODS:
+                    return {"method": method, "of": of, "keeps": True}
                 return {"method": method, "of": of}
             if fn.type == "scoped_identifier":
                 name_n = fn.child_by_field_name("name")
@@ -954,6 +1001,18 @@ def extract_rust(path: Path) -> dict:
             for ref in refs:
                 add_type_ref(func_nid, ref, line, context="generic_arg" if ref[1] == "generic_arg" else "return_type")
 
+    def add_field_node(owner_nid: str, owner_name: str, field_name: str, line: int) -> None:
+        """A named field of a struct, union or struct-style variant, labelled
+        `Owner.field` so it never collides with a same-named method, and
+        `contains`-linked from its owner. `_rust_field` names it for the corpus
+        pass that binds `x.field` reads and writes to it."""
+        if not field_name or owner_nid not in seen_ids:
+            return
+        field_nid = _make_id(owner_nid, "field", field_name)
+        add_node(field_nid, f"{owner_name}.{field_name}", line)
+        node_by_id[field_nid]["_rust_field"] = field_name
+        add_edge(owner_nid, field_nid, "contains", line)
+
     def walk(
         node,
         parent_impl_nid: str | None = None,
@@ -1087,6 +1146,9 @@ def extract_rust(path: Path) -> dict:
                             if field_name is not None and field_type:
                                 declaration_node.setdefault("_rust_fields", {})[
                                     _read_text(field_name, source)] = field_type
+                            if field_name is not None:
+                                add_field_node(item_nid, item_name, _read_text(field_name, source),
+                                               field.start_point[0] + 1)
                             if type_node is None:
                                 for fc in field.children:
                                     if fc.type in ("type_identifier", "generic_type",
@@ -1174,6 +1236,11 @@ def extract_rust(path: Path) -> dict:
                                             continue
                                         type_node = field.child_by_field_name("type")
                                         _emit_enum_type(type_node, field.start_point[0] + 1)
+                                        fname_node = field.child_by_field_name("name")
+                                        if fname_node is not None and vname_node is not None and vname:
+                                            add_field_node(_make_id(item_nid, vname), vname,
+                                                           _read_text(fname_node, source),
+                                                           field.start_point[0] + 1)
                 if t == "trait_item":
                     # The methods a trait declares are its contract, and they were not
                     # reached: this branch returns below, so nothing walked the body.
@@ -1403,6 +1470,60 @@ def extract_rust(path: Path) -> dict:
         return in_file_items.get("::".join(base + rest)) if rest else None
 
     local_consts: dict[str, set[str]] = {}
+    # `x.field` reads and writes, and `T { field: .. }` initialisers, with how the
+    # receiver's type is found. The corpus pass binds each to the `T.field` node.
+    field_accesses: list[dict] = []
+    seen_field_accesses: set[tuple] = set()
+
+    def field_access(caller_nid: str, field: str, receiver: dict, access: str,
+                     line: int, context: str) -> None:
+        key = (caller_nid, field, json.dumps(receiver, sort_keys=True), access)
+        if key in seen_field_accesses:
+            return
+        seen_field_accesses.add(key)
+        field_accesses.append({
+            "caller_nid": caller_nid,
+            "field": field,
+            "rust_receiver": receiver,
+            "access": access,
+            "context": context,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+        })
+
+    def record_field_use(node, caller_nid: str, typer: "_RustReceiverTyper") -> None:
+        if node.type == "field_expression":
+            fld = node.child_by_field_name("field")
+            parent = node.parent
+            if fld is None or fld.type != "field_identifier" or parent is None:
+                return
+            if parent.type == "generic_function" or (
+                    parent.type == "call_expression" and parent.child_by_field_name("function") == node):
+                return  # `x.m()`: a method, which walk_calls binds as a call
+            writes = (parent.type in ("assignment_expression", "compound_assignment_expr")
+                      and parent.child_by_field_name("left") == node)
+            receiver = typer.describe(node.child_by_field_name("value"))
+            if receiver is not None:
+                # the field's own line: in a chain (`self\n    .entries`) the
+                # expression starts at the receiver
+                field_access(caller_nid, _read_text(fld, source), receiver,
+                             "writes" if writes else "reads", fld.start_point[0] + 1,
+                             "assign" if writes else "read")
+        elif node.type == "struct_expression":
+            receiver = typer.describe(node)
+            body = node.child_by_field_name("body")
+            if receiver is None or body is None:
+                return
+            for init in body.named_children:
+                if init.type == "field_initializer":
+                    name = init.child_by_field_name("field")
+                elif init.type == "shorthand_field_initializer":
+                    name = next((c for c in init.named_children if c.type == "identifier"), None)
+                else:
+                    continue
+                if name is not None and name.type in ("field_identifier", "identifier"):
+                    field_access(caller_nid, _read_text(name, source), receiver, "writes",
+                                 init.start_point[0] + 1, "init")
 
     def reference(node, caller_nid: str, self_type: str | None, scope: tuple[str, ...]) -> None:
         # A variant or constant named as a value or in a pattern: `Err(E::Missing)`,
@@ -1478,6 +1599,8 @@ def extract_rust(path: Path) -> dict:
     ) -> None:
         if node.type in ("function_item", "use_declaration", "attribute_item"):
             return
+        if typer is not None and node.type in ("field_expression", "struct_expression"):
+            record_field_use(node, caller_nid, typer)
         if node.type in ("scoped_identifier", "identifier") or (
                 node.type == "scoped_type_identifier" and node.parent is not None
                 and node.parent.type in ("struct_expression", "struct_pattern")):
@@ -1656,4 +1779,7 @@ def extract_rust(path: Path) -> dict:
         if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from")):
             clean_edges.append(edge)
 
-    return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    result = {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    if field_accesses:
+        result["rust_field_accesses"] = field_accesses
+    return result

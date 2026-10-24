@@ -4439,7 +4439,7 @@ def _merge_csharp_partial_class_nodes(
     # cross-file call pass after this merge — a top-level raw call whose caller
     # is a merged-away class half must follow it onto the canonical node.
     for result in per_file:
-        for rc in result.get("raw_calls", []) or []:
+        for rc in [*(result.get("raw_calls", []) or []), *(result.get("rust_field_accesses", []) or [])]:
             cn = rc.get("caller_nid")
             if cn in remap:
                 rc["caller_nid"] = remap[cn]
@@ -7291,7 +7291,13 @@ def _resolve_rust_typed_member_calls(
         for rc in result.get("raw_calls", [])
         if rc.get("rust_receiver") and rc.get("callee") and rc.get("caller_nid")
     ]
-    if not raw:
+    accesses = [
+        fa
+        for result in per_file
+        for fa in result.get("rust_field_accesses", [])
+        if fa.get("rust_receiver") and fa.get("field") and fa.get("caller_nid")
+    ]
+    if not raw and not accesses:
         return
     from graphify.extractors.rust import _rust_type_last_segment
 
@@ -7341,7 +7347,7 @@ def _resolve_rust_typed_member_calls(
     # their crate, and a checkout that itself sits under a `src` folder does not
     # merge every crate into one.
     rust_paths = {f for f in (_file(nid) for nid in node_by_id) if f.endswith(".rs")}
-    rust_paths |= {str(rc.get("source_file", "")).replace("\\", "/") for rc in raw}
+    rust_paths |= {str(rc.get("source_file", "")).replace("\\", "/") for rc in [*raw, *accesses]}
     crate_roots = _rust_crate_roots(rust_paths)
     crate_of: dict[str, str] = {}
 
@@ -7372,13 +7378,35 @@ def _resolve_rust_typed_member_calls(
     def _same_crate(a: str, b: str) -> bool:
         return _same(_crate(a), _crate(b), crate=True)
 
+    # What each file's `use`s name, once the path pass (rust_paths) has pointed
+    # each `use` edge at the item it resolves to: `use super::world::World;` is
+    # an edge from the file node to that one `World`.
+    imported_by_file: dict[str, set[str]] = {}
+    for e in all_edges:
+        if e.get("relation") not in ("imports", "imports_from"):
+            continue
+        src = node_by_id.get(str(e.get("source") or ""))
+        if src is None or not str(src.get("source_file") or "").endswith(".rs"):
+            continue
+        src_file = _file(str(src["id"]))
+        if str(src.get("label") or "") == src_file.rsplit("/", 1)[-1]:
+            imported_by_file.setdefault(src_file, set()).add(str(e.get("target") or ""))
+
+    def _imported(from_file: str) -> set[str]:
+        found = imported_by_file.get(from_file)
+        if found is not None:
+            return found
+        return next((v for f, v in imported_by_file.items() if _same(f, from_file)), set())
+
     def _pick(nids: list[str], from_file: str) -> str | None:
-        # One definition, or the one in the caller's file, or in its crate.
+        # One definition, or the one in the caller's file, or in its crate, or
+        # the one the caller's file `use`s (two `World`s in one crate).
         if len(nids) == 1:
             return nids[0]
         for narrowed in (
             [n for n in nids if _same(_file(n), from_file)],
             [n for n in nids if _same_crate(_file(n), from_file)],
+            [n for n in nids if n in _imported(from_file)],
         ):
             if len(narrowed) == 1:
                 return narrowed[0]
@@ -7432,8 +7460,15 @@ def _resolve_rust_typed_member_calls(
             return _returns(_pick(free_fns.get(str(desc["fn"]), []), from_file), want_ok)
         if "method" in desc:
             owner = _eval(desc.get("of"), from_file, False, depth + 1)
-            return _returns(_method(owner, str(desc["method"])), want_ok) if owner else None
+            method = _method(owner, str(desc["method"])) if owner else None
+            if method is None and desc.get("keeps"):
+                # `opt.filter(..)` on a std wrapper: it holds what `opt` holds.
+                return _eval(desc.get("of"), from_file, want_ok, depth + 1)
+            return _returns(method, want_ok)
         return None
+
+    _resolve_rust_field_accesses(accesses, all_nodes, all_edges, _eval, _file, _same, _pick,
+                                 declared_by_type)
 
     existing_pairs = {
         (e.get("source"), e.get("target")) for e in all_edges if e.get("relation") == "calls"
@@ -7455,6 +7490,56 @@ def _resolve_rust_typed_member_calls(
             "confidence_score": 0.85,
             "source_file": source_file,
             "source_location": rc.get("source_location"),
+            "weight": 1.0,
+        })
+
+
+def _resolve_rust_field_accesses(accesses, all_nodes, all_edges, _eval, _file, _same, _pick,
+                                 declared_by_type) -> None:
+    """Bind each `x.field` read or write, and `T { field: .. }` initialiser, to the
+    `T.field` node of the struct the receiver's type names.
+
+    The receiver is evaluated as `_resolve_rust_typed_member_calls` evaluates a
+    method call's, through the same closures, and the same uniqueness applies: a
+    type that does not narrow to one declaration adds no edge. INFERRED, like a
+    typed call: the type comes from names in the source, not a type checker.
+    One edge per (function, field, relation), at its first site.
+    """
+    if not accesses:
+        return
+    node_by_id = {str(n.get("id")): n for n in all_nodes if n.get("id")}
+    fields_of: dict[tuple[str, str], str] = {}
+    for e in all_edges:
+        if e.get("relation") != "contains":
+            continue
+        tgt = node_by_id.get(str(e.get("target") or ""))
+        if tgt is not None and tgt.get("_rust_field"):
+            fields_of[(str(e.get("source")), str(tgt["_rust_field"]))] = str(tgt["id"])
+    seen = {(e.get("source"), e.get("target"), e.get("relation"))
+            for e in all_edges if e.get("relation") in ("reads", "writes")}
+    for fa in accesses:
+        caller = str(fa["caller_nid"])
+        source_file = str(fa.get("source_file", ""))
+        from_file = _file(caller) or source_file.replace("\\", "/")
+        owner = _eval(fa["rust_receiver"], from_file)
+        if owner is None:
+            continue
+        decl = _pick([d for d in declared_by_type.get(owner[0], []) if _same(_file(d), owner[1])],
+                     from_file)
+        field_nid = fields_of.get((decl, str(fa["field"]))) if decl else None
+        relation = "writes" if fa.get("access") == "writes" else "reads"
+        if field_nid is None or (caller, field_nid, relation) in seen:
+            continue
+        seen.add((caller, field_nid, relation))
+        all_edges.append({
+            "source": caller,
+            "target": field_nid,
+            "relation": relation,
+            "context": str(fa.get("context") or relation),
+            "confidence": "INFERRED",
+            "confidence_score": 0.85,
+            "source_file": source_file,
+            "source_location": fa.get("source_location"),
             "weight": 1.0,
         })
 
@@ -9913,10 +9998,15 @@ def extract(
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
     all_raw_calls: list[dict] = []
+    # Rust `x.field` uses carry caller_nid like raw_calls, and every id remap
+    # below rewrites them with it; they are a bucket of their own because the
+    # call passes that read raw_calls would take them for calls.
+    all_field_accesses: list[dict] = []
     for result in per_file:
         all_nodes.extend(result.get("nodes", []))
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
+        all_field_accesses.extend(result.get("rust_field_accesses", []))
     # Function / method / class def ids for the cross-file indirect_call callable
     # guard. Built from the `_callable` node marker AFTER the id-remap / disambiguation
     # passes below (which rewrite node ids), so it can never go stale — see the
@@ -10215,7 +10305,7 @@ def extract(
         # indirect_call edge keeps the machine-specific absolute-derived
         # source and matches no node in the graph (#2231). Mirrors the
         # sym_remap raw_calls rewrite in the prefix pass below.
-        for rc in all_raw_calls:
+        for rc in [*all_raw_calls, *all_field_accesses]:
             _new = _remapped(rc.get("caller_nid"), rc.get("source_file"))
             if _new is not None:
                 rc["caller_nid"] = _new
@@ -10296,7 +10386,7 @@ def extract(
             # raw_calls carry caller_nid (a symbol id) consumed by the cross-file
             # call pass below, after this remap — rewrite it too or those edges
             # would dangle on their (stale) source.
-            for rc in all_raw_calls:
+            for rc in [*all_raw_calls, *all_field_accesses]:
                 cn = rc.get("caller_nid")
                 if cn in sym_remap:
                     rc["caller_nid"] = sym_remap[cn]
