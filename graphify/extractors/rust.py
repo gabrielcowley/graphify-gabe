@@ -1,6 +1,7 @@
 """Rust extractor. Moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import re
@@ -284,6 +285,55 @@ _RUST_CONST_NAME = re.compile(r"[A-Z][A-Z0-9_]*[A-Z0-9][A-Z0-9_]*")
 # Where an identifier or a path is not a reference of its own: part of a longer
 # path, a macro's name or token tree, a generic call's function, a binding, or
 # a declaration in a function body (a local enum's variant, a const generic).
+# Standard macros whose arguments are Rust expressions: walked like any other
+# code once re-parsed (see `extract_rust`'s macro fragments). `matches!` and
+# `assert_matches!` take an expression and a pattern.
+_RUST_EXPRESSION_MACROS = frozenset({
+    "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
+    "format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln",
+    "panic", "vec", "dbg", "unreachable", "todo", "unimplemented",
+})
+_RUST_PATTERN_MACROS = frozenset({"matches", "assert_matches", "debug_assert_matches"})
+_RUST_FRAGMENT_ROUNDS = 4  # macros nested this deep inside one another are walked
+_RUST_BLANK = bytes(i if i in (10, 13) else 32 for i in range(256))
+
+
+def _rust_macro_fragments(node) -> list[tuple[int, int, tuple[str, ...], tuple[str, ...]]]:
+    """How a std macro's arguments parse as Rust: (start, end, before, after) per
+    fragment, where the bytes start..end of the file, between the tokens
+    `before` and `after`, are a function. `assert_eq!(a, b)` is one, `(a, b)`
+    in `fn _ ( ) { .. ; }`; `matches!(e, P)` is `(e` closed by `)` and `P`
+    as a match arm. [] for any other macro or shape."""
+    name_node = node.child_by_field_name("macro")
+    if name_node is None or name_node.type not in ("identifier", "scoped_identifier"):
+        return []
+    if name_node.type == "scoped_identifier":
+        name_node = name_node.child_by_field_name("name")
+        if name_node is None:
+            return []
+    name = name_node.text.decode("utf-8", errors="replace") if name_node.text else ""
+    tree = next((c for c in node.children if c.type == "token_tree"), None)
+    if tree is None or len(tree.children) < 2:
+        return []
+    opener = tree.children[0].type
+    fn_open = ("fn", "_", "(", ")", "{")
+    if name in _RUST_EXPRESSION_MACROS and opener in ("(", "["):
+        return [(tree.start_byte, tree.end_byte, fn_open, (";", "}"))]
+    if name not in _RUST_PATTERN_MACROS or opener != "(":
+        return []
+    commas = [c for c in tree.children[1:-1] if c.type == ","]
+    if not commas:
+        return []
+    first = commas[0]
+    # The pattern runs to the next top-level comma (`assert_matches!`'s message)
+    # or the closing parenthesis.
+    pattern_end = commas[1].start_byte if len(commas) > 1 else tree.children[-1].start_byte
+    return [
+        (tree.start_byte, first.start_byte, fn_open, (")", ";", "}")),
+        (first.end_byte, pattern_end, fn_open + ("match", "(", ")", "{"), ("=>", "{", "}", "}", "}")),
+    ]
+
+
 _RUST_NOT_A_REFERENCE_PARENTS = frozenset({
     "scoped_identifier", "scoped_type_identifier", "macro_invocation", "token_tree",
     "generic_function", "let_declaration", "parameter", "closure_parameters",
@@ -1584,6 +1634,94 @@ def extract_rust(path: Path) -> dict:
         return in_file_items.get("::".join(base + rest)) if rest else None
 
     local_consts: dict[str, set[str]] = {}
+    # Std macro arguments found by walk_calls, with the context they were found in.
+    macro_fragments: list[tuple[tuple, tuple]] = []
+
+    def walk_macro_fragments() -> None:
+        """Walk every std macro's arguments as the code they are.
+
+        tree-sitter leaves a macro's arguments a flat token tree, so
+        `matches!(op, Op::A | Op::B)` and `assert_eq!(x, LIMIT)` added no edge.
+        Each fragment is parsed in a copy of the file blanked to spaces, newlines
+        kept, with only its own bytes and the few tokens that make it a function
+        (`_rust_macro_fragments`) written in, so every node keeps its offset and
+        line in the real file and walk_calls reads it from `source` as it does
+        any other. Fragments that do not overlap share a copy, so a file costs a
+        few parses, not one per macro; a macro inside another is found walking
+        the outer one and parsed in the next round. A fragment that does not
+        parse cleanly adds nothing, as before.
+        """
+        template = source.translate(_RUST_BLANK)
+        for _round in range(_RUST_FRAGMENT_ROUNDS):
+            if not macro_fragments:
+                return
+            pending = macro_fragments[:]
+            macro_fragments.clear()
+            copies: list[tuple[bytearray, list[tuple[int, int]], list]] = []
+            for fragment, context in pending:
+                for buf, taken, placed in copies:
+                    if place_fragment(buf, taken, fragment):
+                        placed.append((fragment, context))
+                        break
+                else:
+                    buf, taken = bytearray(template), []
+                    if place_fragment(buf, taken, fragment):
+                        copies.append((buf, taken, [(fragment, context)]))
+            for buf, _taken, placed in copies:
+                root_node = parser.parse(bytes(buf)).root_node
+                by_start = {fragment[0]: (fragment, context) for fragment, context in placed}
+                starts = sorted(by_start)
+                for fn in root_node.children:
+                    if fn.type != "function_item" or fn.has_error:
+                        continue
+                    i = bisect.bisect_left(starts, fn.start_byte)
+                    if i == len(starts) or starts[i] >= fn.end_byte:
+                        continue
+                    _fragment, (caller, self_type, impl_key, scope, typer) = by_start[starts[i]]
+                    body = fn.child_by_field_name("body")
+                    if body is not None:
+                        walk_calls(body, caller, self_type, impl_key, scope, typer)
+
+    def place_fragment(buf: bytearray, taken: list[tuple[int, int]], fragment) -> bool:
+        """Write ``fragment`` into ``buf`` if its bytes and tokens fit between the
+        fragments already there (``taken``, as (start, end) spans), else False.
+        Each token goes in a run of blank bytes with no newline in it, one blank
+        byte from its neighbours, so lines and every other offset stay put."""
+        start, end, before, after = fragment
+        lo = max((b for a, b in taken if b <= start), default=0)
+        hi = min((a for a, b in taken if a >= end), default=None)
+        if any(a < end and b > start for a, b in taken):
+            return False
+        spots: list[tuple[int, bytes]] = []
+        cursor = start - 1
+        for token in reversed(before):
+            width = len(token)
+            j = cursor
+            while j - width >= lo and b"\n" in buf[j - width:j]:
+                j -= 1
+            if j - width < lo:
+                return False
+            spots.append((j - width, token.encode()))
+            cursor = j - width - 1
+        first = cursor + 1
+        cursor = end + 1
+        for token in after:
+            width = len(token)
+            j = cursor
+            while (hi is None or j + width <= hi) and j + width <= len(buf) and b"\n" in buf[j:j + width]:
+                j += 1
+            if hi is not None and j + width > hi:
+                return False
+            if j + width > len(buf):
+                buf.extend(b" " * (j + width - len(buf)))
+            spots.append((j, token.encode()))
+            cursor = j + width + 1
+        buf[start:end] = source[start:end]
+        for at, text in spots:
+            buf[at:at + len(text)] = text
+        taken.append((max(first - 1, 0), cursor))
+        return True
+
     # `x.field` reads and writes, and `T { field: .. }` initialisers, with how the
     # receiver's type is found. The corpus pass binds each to the `T.field` node.
     field_accesses: list[dict] = []
@@ -1772,10 +1910,18 @@ def extract_rust(path: Path) -> dict:
                             "source_location": f"L{line}",
                             "weight": 1.0,
                         })
-            # Fall through to the generic child recursion below rather than
-            # returning, preserving the prior traversal of the invocation's
-            # subtree (its arguments are a raw token tree, so this neither adds
-            # nor drops any nested edges relative to before).
+            # A std macro's arguments are code tree-sitter left as tokens: they
+            # are walked from their own parse (below), so not as tokens here.
+            name_text = _read_text(macro_node, source).rsplit("::", 1)[-1] if macro_node is not None else ""
+            fragments = [] if name_text in macro_nids_by_name else _rust_macro_fragments(node)
+            if fragments:
+                for fragment in fragments:
+                    macro_fragments.append((fragment, (caller_nid, self_type, self_impl_key, scope, typer)))
+                return
+            # Otherwise fall through to the generic child recursion below,
+            # preserving the prior traversal of the invocation's subtree (its
+            # arguments are a raw token tree, so this neither adds nor drops
+            # any nested edges relative to before).
         if node.type == "call_expression":
             func_node = node.child_by_field_name("function")
             if func_node is not None and func_node.type == "generic_function":
@@ -1914,6 +2060,7 @@ def extract_rust(path: Path) -> dict:
     for caller_nid, body_node, impl_type, impl_key, body_scope in function_bodies:
         typer = _RustReceiverTyper(getattr(body_node, "parent"), source, impl_type)  # the fn item
         walk_calls(body_node, caller_nid, impl_type, impl_key, body_scope, typer)
+    walk_macro_fragments()
 
     valid_ids = seen_ids
     clean_edges = []

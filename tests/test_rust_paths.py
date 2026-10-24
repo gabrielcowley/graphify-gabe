@@ -269,11 +269,13 @@ def test_a_self_variant_in_its_own_impl_is_a_reference(workspace):
 
 def test_a_bare_constant_resolves_through_its_use(workspace):
     limit = _nid(workspace, "LIMIT", "a/src/expect.rs")
-    assert _references_from(workspace, "elsewhere()", "a/src/values.rs") == [(limit, "const", "EXTRACTED")]
+    # `matches!(…)`'s variant is a pattern now that a std macro's arguments are
+    # parsed; std's and an undefined name's constants are still nothing.
+    not_stated = _nid(workspace, "BattleNotStated", "a/src/expect.rs")
+    assert sorted(_references_from(workspace, "elsewhere()", "a/src/values.rs")) == sorted(
+        [(limit, "const", "EXTRACTED"), (not_stated, "match", "EXTRACTED")])
     assert (limit, "const", "EXTRACTED") in _references_from(workspace, "check()", "a/src/other.rs")
     assert _references_from(workspace, "shadowed()", "a/src/values.rs") == []
-    # Not `matches!(…)`'s variant (a macro's arguments are not parsed), nor std's or
-    # an undefined name's constants.
 
 def test_a_struct_style_variant_is_a_reference(tmp_path: Path):
     # `E::V { .. }` spells its path as a type, not a value: as a literal it constructs
