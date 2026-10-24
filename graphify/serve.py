@@ -1860,6 +1860,15 @@ def _near_miss_message(G: nx.Graph, label: str, hits: list[str], *, limit: int =
     named. Listing them, labelled as substring hits, lets the caller retry with
     the real name instead of trusting a different node as the answer.
     """
+    return (
+        f"No exact match for '{sanitize_label(label)}'. These names contain it, "
+        f"but none is called that:\n"
+        + _candidate_listing(G, hits, limit)
+    )
+
+
+def _candidate_listing(G: nx.Graph, hits: list[str], limit: int) -> str:
+    """One line per candidate (label, file, line), then how to retry with one."""
     listing = []
     for nid in hits[:limit]:
         d = G.nodes[nid]
@@ -1875,12 +1884,68 @@ def _near_miss_message(G: nx.Graph, label: str, hits: list[str], *, limit: int =
     source = str(G.nodes[hits[0]].get("source_file") or "").strip()
     example_form = f"{sanitize_label(source)}::{example}" if source else example
     return (
-        f"No exact match for '{sanitize_label(label)}'. These names contain it, "
-        f"but none is called that:\n"
-        + "\n".join(listing)
+        "\n".join(listing)
         + f"\nRetry with the exact label, a path::symbol form (e.g. {example_form}), "
         "or the full node id."
     )
+
+
+def _words_match(a: str, b: str) -> bool:
+    """Same word, or one is the other plus an ending (`action`/`actions`,
+    `handle`/`handler`); the stem must be four letters or more, so `run` does not
+    meet `runtime`."""
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return len(short) >= 4 and long_.startswith(short)
+
+
+_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _name_words(text: str) -> list[str]:
+    """`_search_tokens`, with camelCase split too (`RunTurnActions` -> run turn
+    actions), each word once: so a C or Java spelling meets a snake_case one."""
+    return list(dict.fromkeys(_search_tokens(_CASE_BOUNDARY_RE.sub(" ", str(text)))))
+
+
+def _shared_word_matches(G: nx.Graph, label: str, *, limit: int = 5) -> list[str]:
+    """Nodes whose labels share the most words with *label*, best first.
+
+    For a query that names no label even as a substring: the caller spelt the
+    name another codebase's way (`run_turn_actions` for `.turn_next_action()`).
+    Ranked by the query words a label shares, then by the fewest label words left
+    over, then by edit distance between the two names. A label must share at least
+    half the query's words (one, for a one- or two-word query). Empty when none
+    does.
+    """
+    import difflib
+
+    words = _name_words(label)
+    if not words:
+        return []
+    needed = max(1, (len(words) + 1) // 2)
+    query_text = " ".join(words)
+    ranked: list[tuple[int, int, float, int, str]] = []
+    for pos, (nid, d) in enumerate(G.nodes(data=True)):
+        label_words = _name_words(d.get("label") or "")
+        if not label_words:
+            continue
+        shared = sum(1 for w in words if any(_words_match(w, lw) for lw in label_words))
+        if shared < needed:
+            continue
+        unmatched = sum(1 for lw in label_words if not any(_words_match(w, lw) for w in words))
+        ranked.append((shared, unmatched, 0.0, pos, nid))
+    # Edit distance only for the labels that tie at the top: it is the slow part.
+    ranked.sort(key=lambda r: (-r[0], r[1], r[3]))
+    head = [
+        (shared, unmatched, -difflib.SequenceMatcher(
+            None, query_text, " ".join(_name_words(G.nodes[nid].get("label") or ""))
+        ).ratio(), pos, nid)
+        for shared, unmatched, _, pos, nid in ranked[: limit * 20]
+    ]
+    head.sort(key=lambda r: (-r[0], r[1], r[2], r[3]))
+    return [nid for *_, nid in head[:limit]] + [nid for *_, nid in ranked[limit * 20:]]
 
 
 def _resolve_single_node(G: nx.Graph, label: str) -> tuple[str | None, str | None]:
@@ -1903,7 +1968,11 @@ def _resolve_single_node(G: nx.Graph, label: str) -> tuple[str | None, str | Non
     source_exact, exact, prefix, substring = _find_node_tiers(G, label, winning_tier_only=True)
     if not (source_exact or exact or prefix):
         if not substring:
-            return None, f"No node matching '{label}' found."
+            miss = f"No node matching '{label}' found."
+            shared = _shared_word_matches(G, label)
+            if shared:
+                miss += " These names share words with it:\n" + _candidate_listing(G, shared, 5)
+            return None, miss
         return None, _near_miss_message(G, label, substring)
     tier = source_exact or exact or prefix
     refusal = _tier_refusal(G, label, tier, file_query=bool(source_exact) and "::" not in label)
