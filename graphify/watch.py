@@ -2039,7 +2039,7 @@ def _rebuild_code(
                         "_ts_public_twin", "_py_property", "_java_ret",
                         "_ts_fields", "_ts_static_fields",
                         "_py_fixture",
-                        "_rust_ret", "_rust_ret_ok", "_rust_fields",
+                        "_rust_ret", "_rust_ret_ok", "_rust_fields", "_rust_field",
                     ):
                         if node.get(marker):
                             ctx_node[marker] = node[marker]

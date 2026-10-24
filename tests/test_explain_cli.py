@@ -474,3 +474,30 @@ def test_explain_brief_does_not_cap_the_callers(monkeypatch, tmp_path, capsys):
     assert out.count("\n  ") == 30
     # Sorted by file, then by line as a number (L10 before L13 before L100).
     assert out.splitlines()[2] == "  app/handlers/email.py:L10  caller_0()"
+
+
+def test_explain_brief_lists_a_fields_writers_then_readers(monkeypatch, tmp_path, capsys):
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps({"directed": False, "multigraph": False, "graph": {},
+        "nodes": [
+            {"id": "f", "label": "Battle.finish_turn", "source_file": "b.rs", "source_location": "L2"},
+            {"id": "w", "label": ".finish_turn()", "source_file": "c.rs", "source_location": "L9"},
+            {"id": "r", "label": ".step()", "source_file": "t.rs", "source_location": "L4"},
+        ],
+        "links": [
+            {"source": "w", "target": "f", "relation": "writes", "confidence": "INFERRED",
+             "source_file": "c.rs", "source_location": "L10"},
+            {"source": "r", "target": "f", "relation": "reads", "confidence": "INFERRED",
+             "source_file": "t.rs", "source_location": "L5"},
+        ]}))
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv",
+        ["graphify", "explain", "Battle.finish_turn", "--brief", "--graph", str(p)])
+    mainmod.main()
+    assert capsys.readouterr().out == (
+        "Battle.finish_turn  b.rs L2\n"
+        "Written by (1):\n"
+        "  c.rs:L10  .finish_turn()\n"
+        "Read by (1):\n"
+        "  t.rs:L5  .step()\n"
+    )
