@@ -400,3 +400,77 @@ def test_explain_double_colon_label_not_hijacked_by_a_coincidental_path_match(mo
     out = _run(monkeypatch, p, "mylib::Bar", capsys)
     assert "Ambiguous" not in out
     assert "ID:        mylib_bar" in out
+
+
+def _write_relations_graph(tmp_path):
+    """`target()` in lib/t.py: its file contains it; one caller and one referrer
+    of low degree; and it calls a hub that a dozen other functions also call, so
+    a degree-first order would put the hub above the caller."""
+    nodes = [
+        {"id": "file", "label": "t.py", "source_file": "lib/t.py", "source_location": "L1"},
+        {"id": "target", "label": "target()", "source_file": "lib/t.py", "source_location": "L5"},
+        {"id": "caller", "label": "caller()", "source_file": "app/c.py", "source_location": "L2"},
+        {"id": "user", "label": "USER", "source_file": "app/u.py", "source_location": "L3"},
+        {"id": "hub", "label": "hub()", "source_file": "lib/h.py", "source_location": "L1"},
+    ]
+    links = [
+        {"source": "file", "target": "target", "relation": "contains", "confidence": "EXTRACTED"},
+        {"source": "caller", "target": "target", "relation": "calls", "confidence": "EXTRACTED",
+         "source_file": "app/c.py", "source_location": "L9"},
+        {"source": "user", "target": "target", "relation": "references", "confidence": "EXTRACTED",
+         "source_file": "app/u.py", "source_location": "L4"},
+        {"source": "target", "target": "hub", "relation": "calls", "confidence": "EXTRACTED",
+         "source_file": "lib/t.py", "source_location": "L6"},
+    ]
+    for i in range(12):
+        nodes.append({"id": f"o{i}", "label": f"other_{i}()", "source_file": "lib/o.py",
+                      "source_location": f"L{i + 1}"})
+        links.append({"source": f"o{i}", "target": "hub", "relation": "calls",
+                      "confidence": "EXTRACTED"})
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps({"directed": False, "multigraph": False, "graph": {},
+                             "nodes": nodes, "links": links}))
+    return p
+
+
+def test_explain_lists_callers_then_references_then_callees(monkeypatch, tmp_path, capsys):
+    out = _run(monkeypatch, _write_relations_graph(tmp_path), "target()", capsys)
+    lines = out.split("Connections (3):\n", 1)[1].splitlines()
+    assert lines[0].startswith("  <-- caller() [calls]")
+    assert lines[1].startswith("  <-- USER [references]")
+    assert lines[2].startswith("  --> hub() [calls]")
+
+
+def test_explain_leaves_out_its_own_files_contains_edge(monkeypatch, tmp_path, capsys):
+    # `Source:` already names the file; the edge repeated it as the first line.
+    out = _run(monkeypatch, _write_relations_graph(tmp_path), "target()", capsys)
+    assert "  Degree:    4" in out
+    assert "t.py [contains]" not in out
+
+
+def test_explain_brief_prints_every_caller_and_referrer_as_a_site(monkeypatch, tmp_path, capsys):
+    p = _write_relations_graph(tmp_path)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv",
+        ["graphify", "explain", "target()", "--brief", "--graph", str(p)])
+    mainmod.main()
+    assert capsys.readouterr().out == (
+        "target()  lib/t.py L5\n"
+        "Called by (1):\n"
+        "  app/c.py:L9  caller()\n"
+        "Referenced by (1):\n"
+        "  app/u.py:L4  USER\n"
+    )
+
+
+def test_explain_brief_does_not_cap_the_callers(monkeypatch, tmp_path, capsys):
+    p = _write_high_degree_graph(tmp_path, n_callers=30)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv",
+        ["graphify", "explain", "hub", "--brief", "--graph", str(p)])
+    mainmod.main()
+    out = capsys.readouterr().out
+    assert "Called by (30):" in out
+    assert out.count("\n  ") == 30
+    # Sorted by file, then by line as a number (L10 before L13 before L100).
+    assert out.splitlines()[2] == "  app/handlers/email.py:L10  caller_0()"
