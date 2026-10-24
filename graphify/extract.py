@@ -11233,6 +11233,22 @@ def extract(
                 "weight": 1.0,
             })
 
+    # A C function that names another by value and also calls it (`CreateTask(
+    # Task_X, 0)` before `Task_X(id)`), or is called by the function it names
+    # (a callback that calls back), keeps the call: the graph holds one edge per
+    # pair, either way round, and the indirect one could otherwise replace it.
+    _c_call_pairs = {
+        frozenset((e["source"], e["target"])) for e in all_edges
+        if e.get("relation") == "calls"
+        and str(e.get("source_file", "")).endswith((".c", ".h"))
+    }
+    if _c_call_pairs:
+        all_edges[:] = [
+            e for e in all_edges
+            if not (e.get("relation") == "indirect_call"
+                    and frozenset((e["source"], e["target"])) in _c_call_pairs)
+        ]
+
     # Go: repoint intra-module `imports_from` edges from the synthetic
     # `go_pkg_<import path>` sink onto the imported package's file nodes.
     # extractors/go.py mints the sink from the raw import string with no module
