@@ -122,6 +122,78 @@ def _warn_if_stale(gp: Path, G, built_at_commit, *, found=(), missed: bool = Fal
         print(note, file=sys.stderr)
 
 
+_CALL_RELATIONS = ("calls", "indirect_call")
+
+
+def _explain_rank(direction: str, relation: str) -> int:
+    """`explain`'s connection order: incoming calls, incoming references,
+    outgoing calls, then everything else."""
+    if direction == "in" and relation in _CALL_RELATIONS:
+        return 0
+    if direction == "in" and relation == "references":
+        return 1
+    if direction == "out" and relation in _CALL_RELATIONS:
+        return 2
+    return 3
+
+
+def _is_own_file_contains(G, nid: str, direction: str, nb: str, edata: dict) -> bool:
+    """The `contains` edge from the node's own file node, which `Source:` gives.
+
+    A file node sits at L1 of that file and is labelled with its basename, or a
+    directory-qualified form of it (#2032), as `_find_node_tiers` recognises it.
+    """
+    if direction != "in" or edata.get("relation") != "contains":
+        return False
+    own, other = G.nodes[nid], G.nodes[nb]
+    source = str(own.get("source_file") or "")
+    if not source or str(other.get("source_file") or "") != source:
+        return False
+    if str(other.get("source_location") or "") != "L1":
+        return False
+    name = Path(source).name
+    label = str(other.get("label") or "")
+    return label == name or label.endswith("/" + name)
+
+
+def _print_explain_brief(G, nid: str) -> int:
+    """`explain --brief`: where the node is, then every caller and every
+    reference to it, one `file:line name` each and uncapped. Returns the count."""
+    d = G.nodes[nid]
+    where = f"{d.get('source_file', '')} {d.get('source_location', '')}".strip()
+    print(f"{d.get('label', nid)}  {where}".rstrip())
+    from graphify.build import edge_data
+    calls: list[tuple[str, str]] = []
+    refs: list[tuple[str, str]] = []
+    for nb in set(G.predecessors(nid)) | set(G.successors(nid)):
+        for a, b in ((nb, nid), (nid, nb)):
+            if not G.has_edge(a, b):
+                continue
+            ed = edge_data(G, a, b)
+            if ed.get("_src", a) != nb:
+                continue  # not an edge into this node
+            site = f"{ed.get('source_file') or G.nodes[nb].get('source_file') or '?'}:{ed.get('source_location') or ''}"
+            entry = (site.rstrip(":"), str(G.nodes[nb].get("label", nb)))
+            if ed.get("relation") in _CALL_RELATIONS:
+                calls.append(entry)
+            elif ed.get("relation") == "references":
+                refs.append(entry)
+
+    def _key(entry: tuple[str, str]):
+        path, _, line = entry[0].rpartition(":")
+        digits = line.lstrip("L")
+        return (path or entry[0], int(digits) if digits.isdigit() else 0, entry[1])
+
+    for title, entries in (("Called by", calls), ("Referenced by", refs)):
+        if entries:
+            print(f"{title} ({len(entries)}):")
+            for site, name in sorted(set(entries), key=_key):
+                print(f"  {site}  {name}")
+    if not calls and not refs:
+        print("No callers or references in the graph.")
+    return len(calls) + len(refs)
+
+
 def _log_path_lookup(gp: Path, **fields) -> None:
     """Log a `path` lookup with its outcome: `found`, `no_path` when both ends
     resolved but nothing joins them, or the refused end's `ambiguous` or
@@ -2160,7 +2232,7 @@ def dispatch_command(cmd: str) -> None:
 
     elif cmd == "explain":
         if len(sys.argv) < 3:
-            print('Usage: graphify explain "<node>" [--all] [--graph path]', file=sys.stderr)
+            print('Usage: graphify explain "<node>" [--all | --brief] [--graph path]', file=sys.stderr)
             sys.exit(1)
         from graphify.serve import _is_ambiguity_refusal, _resolve_single_node
         from networkx.readwrite import json_graph
@@ -2169,6 +2241,7 @@ def dispatch_command(cmd: str) -> None:
         graph_path = _default_graph_path()
         args = sys.argv[3:]
         show_all = "--all" in args
+        brief = "--brief" in args
         for i, a in enumerate(args):
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
@@ -2196,6 +2269,13 @@ def dispatch_command(cmd: str) -> None:
             print(refusal)
             sys.exit(EXIT_AMBIGUOUS if _is_ambiguity_refusal(refusal) else EXIT_NOT_FOUND)
         d = G.nodes[nid]
+        if brief:
+            _shown = _print_explain_brief(G, nid)
+            from graphify import querylog
+            querylog.log_query(kind="explain", question=label, corpus=str(gp),
+                               nodes_returned=_shown, outcome="found", brief=True)
+            _touch_query_stamp(gp)
+            return
         print(f"Node: {d.get('label', nid)}")
         print(f"  ID:        {nid}")
         print(
@@ -2244,9 +2324,14 @@ def dispatch_command(cmd: str) -> None:
             connections.append(
                 ("in" if _ed.get("_src", nb) == nb else "out", nb, _ed)
             )
+        connections = [c for c in connections if not _is_own_file_contains(G, nid, *c)]
         if connections:
             print(f"\nConnections ({len(connections)}):")
-            connections.sort(key=lambda c: G.degree(c[1]), reverse=True)
+            # Callers first: they are what a grep for the name cannot give. Then
+            # what references the node, then what it calls, then the rest; by the
+            # neighbour's degree within each.
+            connections.sort(key=lambda c: (_explain_rank(c[0], c[2].get("relation", "")),
+                                            -G.degree(c[1])))
             shown = connections if show_all else connections[:20]
             for direction, nb, edata in shown:
                 rel = edata.get("relation", "")
