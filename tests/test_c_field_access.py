@@ -58,11 +58,9 @@ def _edges(tmp_path: Path) -> set[tuple[str, str, str, str]]:
     (src / "battle.c").write_text(_C, encoding="utf-8")
     r = extract([src / "mon.h", src / "battle.c"], root=tmp_path, cache_root=tmp_path / "out")
     nodes = {n["id"]: n for n in r["nodes"]}
-    owner = {e["target"]: nodes[e["source"]]["label"] for e in r["edges"]
-             if e["relation"] == "defines" and e["source"] in nodes}
     return {
         (nodes[e["source"]]["label"], e["relation"],
-         f"{owner.get(e['target'], '?')}.{nodes[e['target']]['label']}", e["source_location"])
+         nodes[e["target"]]["label"], e["source_location"])
         for e in r["edges"]
         if e["relation"] in ("reads", "writes") and e["source"] in nodes and e["target"] in nodes
     }
@@ -120,7 +118,7 @@ def test_an_unchanged_header_still_types_a_changed_file(tmp_path: Path):
     got = {(labels[e["source"]], e["relation"], labels[e["target"]])
            for e in g["links"] if e["relation"] in ("reads", "writes")}
     # the header's struct, global and macro come from the unchanged graph
-    assert ("Heal()", "writes", "hp") in got
-    assert ("Heal()", "writes", "x") in got
-    assert ("Heal()", "writes", "data") in got
-    assert ("Move()", "writes", "x") in got   # through the header's `#define pX x`
+    assert ("Heal()", "writes", "Mon.hp") in got
+    assert ("Heal()", "writes", "Pos.x") in got
+    assert ("Heal()", "writes", "Task.data") in got
+    assert ("Move()", "writes", "Pos.x") in got   # through the header's `#define pX x`

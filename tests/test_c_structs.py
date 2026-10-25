@@ -59,14 +59,14 @@ def test_a_struct_is_a_node_at_its_definition_with_its_fields(tmp_path: Path):
     # one node, at the definition, not at the forward declaration or a use
     assert [(n["source_file"], n["source_location"]) for n in sprites] == [("src/sprite.h", "L2")]
     fields = {(t, loc) for s, r, t, loc in edges if s == "Sprite" and r == "defines"}
-    assert fields == {("x", "L4"), ("y", "L4"), ("callback", "L5"), ("name", "L6"),
-                      ("data", "L7")}
+    assert fields == {("Sprite.x", "L4"), ("Sprite.y", "L4"), ("Sprite.callback", "L5"),
+                      ("Sprite.name", "L6"), ("Sprite.data", "L7")}
 
 
 def test_an_attribute_macro_does_not_hide_a_field(tmp_path: Path):
     _nodes, edges = _graph(tmp_path)
     fields = {(t, loc) for s, r, t, loc in edges if s == "Timers" and r == "defines"}
-    assert fields == {("state", "L16"), ("timer", "L17"), ("spare", "L18")}
+    assert fields == {("Timers.state", "L16"), ("Timers.timer", "L17"), ("Timers.spare", "L18")}
 
 
 def test_a_call_through_a_function_pointer_field_is_no_call_of_the_field(tmp_path: Path):
@@ -76,7 +76,7 @@ def test_a_call_through_a_function_pointer_field_is_no_call_of_the_field(tmp_pat
 
 def test_a_typedef_struct_and_an_enum(tmp_path: Path):
     _nodes, edges = _graph(tmp_path)
-    assert ("Coords", "defines", "unused", "L9") in edges
+    assert ("Coords", "defines", "Coords.unused", "L9") in edges
     # a function-pointer field is a field, and references its return type
     assert ("Sprite", "references", "Coords", "L5") in edges
     assert ("Weather", "case_of", "WEATHER_NONE", "L10") in edges
@@ -87,7 +87,7 @@ def test_a_struct_named_like_a_function_keeps_both(tmp_path: Path):
     nodes, edges = _graph(tmp_path)
     labels = [n["label"] for n in nodes]
     assert "CableCar" in labels and "CableCar()" in labels
-    assert ("CableCar", "defines", "timer", "L11") in edges
+    assert ("CableCar", "defines", "CableCar.timer", "L11") in edges
 
 
 def test_a_struct_named_by_its_tag_is_referenced(tmp_path: Path):
@@ -110,3 +110,20 @@ def test_a_c_header_naming_templates_stays_c(tmp_path: Path):
     cpp = tmp_path / "box.h"
     cpp.write_text("template <typename T> struct Box { T v; };\n", encoding="utf-8")
     assert _get_extractor(cpp).__name__ == "extract_cpp"
+
+
+def test_a_field_is_looked_up_as_type_dot_field_or_by_its_bare_name(tmp_path: Path):
+    from graphify.build import build_from_json
+    from graphify.serve import _resolve_single_node
+
+    p = tmp_path / "src" / "save.h"
+    p.parent.mkdir(parents=True)
+    p.write_text("struct SaveBlock2 { u8 playerName[8]; u8 playerGender; };\n"
+                 "struct Mail { u8 playerName[8]; };\n", encoding="utf-8")
+    G = build_from_json(extract([p], root=tmp_path, cache_root=tmp_path / "out"))
+    nid, _ = _resolve_single_node(G, "SaveBlock2.playerName")
+    assert nid is not None and G.nodes[nid]["label"] == "SaveBlock2.playerName"
+    nid, _ = _resolve_single_node(G, "playerGender")
+    assert nid is not None and G.nodes[nid]["label"] == "SaveBlock2.playerGender"
+    nid, msg = _resolve_single_node(G, "playerName")   # two structs have one
+    assert nid is None and msg.startswith("Ambiguous")

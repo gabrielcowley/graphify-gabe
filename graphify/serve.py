@@ -496,10 +496,10 @@ def _get_trigram_index(G: nx.Graph) -> dict:
 def _field_name_keys(d: dict) -> tuple[str, str] | None:
     """A field node's bare name as the exact tiers compare it: (tokenized,
     punctuated). A field is labelled `Type.field` (extractors/rust.py marks it
-    `_rust_field`), but code names it bare, so `overrun_frames_owed` is an exact
+    `_rust_field`; a C one `_c_field`), but code names it bare, so `overrun_frames_owed` is an exact
     match for `Game.overrun_frames_owed` as `finish_turn` is for
     `finish_turn()`. None for any other node."""
-    field = d.get("_rust_field")
+    field = d.get("_rust_field") or d.get("_c_field")
     if not isinstance(field, str) or not field:
         return None
     return " ".join(_search_tokens(field)), _strip_diacritics(field).lower()
@@ -1833,8 +1833,9 @@ def _find_node_tiers(
         def _spellings(nid: str) -> set[str]:
             d = G.nodes[nid]
             names = {str(d.get("label") or "").removesuffix("()").lstrip(".")}
-            if isinstance(d.get("_rust_field"), str):
-                names.add(d["_rust_field"])
+            for marker in ("_rust_field", "_c_field"):
+                if isinstance(d.get(marker), str):
+                    names.add(d[marker])
             return names
 
         cased = [nid for nid in exact if wanted in _spellings(nid)]
