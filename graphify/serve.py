@@ -1824,6 +1824,23 @@ def _find_node_tiers(
         if len(preferred) == 1:
             source_exact = preferred + [nid for nid in source_exact if nid != preferred[0]]
 
+    if len(exact) > 1:
+        # The exact tier folds case, so the type `Weather` and the fields named
+        # `weather` all match either spelling. A query spelled exactly as some
+        # of them names those.
+        wanted = str(label).strip().removesuffix("()").lstrip(".")
+
+        def _spellings(nid: str) -> set[str]:
+            d = G.nodes[nid]
+            names = {str(d.get("label") or "").removesuffix("()").lstrip(".")}
+            if isinstance(d.get("_rust_field"), str):
+                names.add(d["_rust_field"])
+            return names
+
+        cased = [nid for nid in exact if wanted in _spellings(nid)]
+        if cased:
+            exact = cased
+
     return source_exact, exact, prefix, substring
 
 

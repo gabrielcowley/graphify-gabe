@@ -557,6 +557,25 @@ def test_field_names_tier_alike_through_the_index_and_the_scan():
         assert fast == ((full[0], full[1], [], []) if full[0] or full[1] else full), q
 
 
+def _case_graph() -> nx.Graph:
+    G = nx.Graph()
+    G.add_node("weather_t", label="Weather", norm_label="weather", source_file="include/field_weather.h", source_location="L10")
+    G.add_node("save_weather", label="weather", norm_label="weather", source_file="include/global.h", source_location="L20")
+    G.add_node("map_weather", label="weather", norm_label="weather", source_file="include/fieldmap.h", source_location="L30")
+    G.add_node("cmd", label="Weather.weather", norm_label="weather.weather", _rust_field="weather", source_file="src/w.rs", source_location="L5")
+    return G
+
+
+def test_a_query_spelled_as_one_label_prefers_it_over_case_folded_ones():
+    # The exact tier folds case: `Weather` the type and the fields `weather`
+    # match either spelling, until one spelling picks its own.
+    assert _resolve_single_node(_case_graph(), "Weather") == ("weather_t", None)
+    nid, msg = _resolve_single_node(_case_graph(), "weather")
+    assert nid is None and msg.startswith("Ambiguous: 'weather' matches 3 nodes")
+    # a spelling none of them has keeps every one
+    assert len(_find_node_tiers(_case_graph(), "WEATHER")[1]) == 4
+
+
 def test_strip_diacritics_leaves_ascii_alone_and_folds_the_rest():
     assert _strip_diacritics("Foo.Bar:Baz") == "Foo.Bar:Baz"
     assert _strip_diacritics("Café") == "Cafe"
