@@ -2405,6 +2405,25 @@ def _c_field_name(declarator, source: bytes) -> str | None:
     return None
 
 
+def _c_declares_array(declarator) -> bool:
+    """Whether a C variable or field declarator makes an array: `u8 x[8]` and
+    `u8 *x[8]` do, `u8 (*x)[8]` and `u8 *x` do not."""
+    node, last = declarator, None
+    while node is not None:
+        if node.type in ("field_identifier", "identifier"):
+            return last == "array_declarator"
+        if node.type not in ("parenthesized_declarator", "attributed_declarator",
+                             "init_declarator"):
+            last = node.type
+        inner = node.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((c for c in node.named_children
+                          if c.type in ("field_identifier", "identifier")
+                          or c.type in _C_WRAPPING_DECLARATORS), None)
+        node = inner
+    return False
+
+
 def _c_attribute_recovered_name(field_decl, source: bytes) -> str | None:
     """The real name of a C field that an attribute macro hid from the parser.
 
@@ -2759,15 +2778,77 @@ def _c_receiver(node, source: bytes, local_types: dict[str, str]):
     return None
 
 
-def _c_field_access(node) -> str:
-    """`writes` when a C field expression is assigned or incremented, through
-    `[i]` and parentheses (`gTasks[id].data[0] = 1` writes `data`), else
-    `reads`."""
+# The C library's, the GBA SDK macros' (`gba/macro.h`) and the pret decomps'
+# own functions that store through a pointer argument, and which argument
+# (from 0) that is: `CpuFill16(0, &gX, size)` writes `gX`.
+_C_DESTINATION_ARGS = {
+    "memcpy": 0, "memmove": 0, "memset": 0, "strcpy": 0, "strncpy": 0, "strcat": 0,
+    "sprintf": 0,
+    "CpuFill16": 1, "CpuFill32": 1, "CpuFastFill": 1, "CpuFastFill8": 1,
+    "CpuFastFill16": 1, "CpuCopy16": 1, "CpuCopy32": 1, "CpuFastCopy": 1,
+    "CpuSet": 1, "CpuFastSet": 1,
+    "DmaFill16": 2, "DmaFill32": 2, "DmaClear16": 1, "DmaClear32": 1,
+    "DmaCopy16": 2, "DmaCopy32": 2, "DmaCopyLarge16": 2, "DmaCopyLarge32": 2,
+    "DmaFillLarge16": 2, "DmaFillLarge32": 2, "DmaClearLarge16": 1, "DmaClearLarge32": 1,
+    "DmaCopy16Defvars": 2, "DmaCopy32Defvars": 2, "DmaFill16Defvars": 2,
+    "DmaFill32Defvars": 2, "DmaClear16Defvars": 1, "DmaClear32Defvars": 1,
+    "LZ77UnCompWram": 1, "LZ77UnCompVram": 1, "RLUnCompWram": 1, "RLUnCompVram": 1,
+    "LZDecompressWram": 1, "LZDecompressVram": 1,
+    "StringCopy": 0, "StringCopyN": 0, "StringAppend": 0, "StringAppendN": 0,
+    "StringCopyPadded": 0, "StringFill": 0, "StringCopy_Nickname": 0,
+    "StringGet_Nickname": 0, "StringExpandPlaceholders": 0,
+    "ConvertIntToDecimalStringN": 0, "ConvertIntToHexStringN": 0,
+    "GetMonData": 2, "GetBoxMonData": 2, "GetMonNickname": 1, "GetBoxMonNickname": 1,
+    "CopyItemName": 1, "CopyItemNameHandlePlural": 1, "GetSpeciesName": 0,
+}
+
+
+def _c_destination(node, source: bytes) -> bool:
+    """Whether a C expression, through parentheses and casts, is the argument
+    a call stores through (`_C_DESTINATION_ARGS`)."""
     cur, parent = node, node.parent
+    while parent is not None and (
+        parent.type == "parenthesized_expression"
+        or (parent.type == "cast_expression" and parent.child_by_field_name("value") == cur)
+    ):
+        cur, parent = parent, parent.parent
+    if parent is None or parent.type != "argument_list":
+        return False
+    call = parent.parent
+    fn = call.child_by_field_name("function") if call is not None else None
+    if fn is None or fn.type != "identifier":
+        return False
+    at = _C_DESTINATION_ARGS.get(_read_text(fn, source))
+    args = [c for c in parent.named_children if c.type != "comment"]
+    return at is not None and at < len(args) and args[at] == cur
+
+
+def _c_stored_through(cur, parent, source: bytes, indexed: bool) -> str | None:
+    """`writes` when the C expression `cur` (a use of a variable or field, its
+    `[i]` and `.` included) has its address passed where a call stores
+    (`&gX`, `&gX[2]`), `fills` when it is passed there itself and not indexed,
+    which writes it only if it is an array (`StringCopy(gStringVar1, ...)`;
+    through a pointer `gX` it is the pointer that is read), else None."""
+    if parent.type == "pointer_expression":
+        op = parent.child_by_field_name("operator")
+        if op is not None and op.type == "&" and _c_destination(parent, source):
+            return "writes"
+        return None
+    return "fills" if not indexed and _c_destination(cur, source) else None
+
+
+def _c_field_access(node, source: bytes) -> str:
+    """`writes` when a C field expression is assigned or incremented, through
+    `[i]` and parentheses (`gTasks[id].data[0] = 1` writes `data`), or has its
+    address passed where a call stores; `fills` when it is passed there itself
+    (see `_c_stored_through`); else `reads`."""
+    cur, parent = node, node.parent
+    indexed = False
     while parent is not None and (
         (parent.type == "subscript_expression" and parent.child_by_field_name("argument") == cur)
         or parent.type == "parenthesized_expression"
     ):
+        indexed = indexed or parent.type == "subscript_expression"
         cur, parent = parent, parent.parent
     if parent is None:
         return "reads"
@@ -2775,28 +2856,31 @@ def _c_field_access(node) -> str:
         return "writes"
     if parent.type == "update_expression":
         return "writes"
-    return "reads"
+    return _c_stored_through(cur, parent, source, indexed) or "reads"
 
 
 def _c_global_use(node, source: bytes) -> str | None:
     """`writes` or `reads` when a C identifier in a body may name a global, None
     when it cannot: a macro or enumerator spelled in capitals. A call through
     it (`sCallback()`) reads it; a function's name matches no global. Changing the variable's own storage is a write, through `[i]`, `.`
-    and parentheses (`gTasks[id].func = f` writes `gTasks`); through `->` or `*`
+    and parentheses (`gTasks[id].func = f` writes `gTasks`), as is passing its
+    address where a call stores (`CpuFill16(0, &gX, size)`), and passing it
+    there itself is `fills` (see `_c_stored_through`); through `->` or `*`
     it is the pointer that is read (`gSaveBlock2Ptr->playerGender = 1`)."""
     parent = node.parent
     if parent is None:
         return None
     if _C_CAPITALS.match(_read_text(node, source)):
         return None
-    cur = node
+    cur, indexed = node, False
     while parent is not None:
         if parent.type == "subscript_expression" and parent.child_by_field_name("argument") == cur:
-            pass
+            indexed = True
         elif parent.type == "field_expression" and parent.child_by_field_name("argument") == cur:
             op = parent.child_by_field_name("operator")
             if op is not None and op.type == "->":
                 return "reads"
+            indexed = True
         elif parent.type != "parenthesized_expression":
             break
         cur, parent = parent, parent.parent
@@ -2806,7 +2890,7 @@ def _c_global_use(node, source: bytes) -> str | None:
         return "writes"
     if parent.type == "update_expression":
         return "writes"
-    return "reads"
+    return _c_stored_through(cur, parent, source, indexed) or "reads"
 
 
 _C_CAPITALS = re.compile(r"^[A-Z0-9_]+$")
@@ -8437,6 +8521,8 @@ def _extract_generic(
                         ftype_node = node.child_by_field_name("type")
                         marks = c_node_markers.setdefault(member_nid, {})
                         marks["_c_field"] = name
+                        if _c_declares_array(decl):
+                            marks["_c_array"] = True
                         if (is_nested_type and ftype_node is not None
                                 and ftype_node.child_by_field_name("name") is None):
                             # its anonymous type, the parent's `type` of this name;
@@ -10902,7 +10988,7 @@ def _extract_generic(
                     "caller_nid": caller_nid,
                     "c_receiver": receiver,
                     "field": _read_text(field, source),
-                    "access": _c_field_access(node),
+                    "access": _c_field_access(node, source),
                     "source_file": str_path,
                     "source_location": f"L{field.start_point[0] + 1}",
                 })
@@ -10917,7 +11003,8 @@ def _extract_generic(
             if access is not None:
                 key = (caller_nid, name)
                 seen = c_global_uses.get(key)
-                if seen is None or (access == "writes" and seen["access"] == "reads"):
+                rank = {"reads": 0, "fills": 1, "writes": 2}
+                if seen is None or rank[access] > rank[seen["access"]]:
                     c_global_uses[key] = {
                         "caller_nid": caller_nid,
                         "c_global": name,
@@ -11192,8 +11279,10 @@ def _extract_generic(
                     add_node(nid, name, line)
                     add_edge(file_nid, nid, "contains", line)
                     c_var_nids[name] = nid
-                    c_node_markers.setdefault(nid, {})["_c_var"] = \
-                        "static" if "static" in storage else "global"
+                    marks = c_node_markers.setdefault(nid, {})
+                    marks["_c_var"] = "static" if "static" in storage else "global"
+                    if _c_declares_array(d):
+                        marks["_c_array"] = True
             elif top.type.startswith("preproc_") or top.type in ("linkage_specification",
                                                                   "declaration_list"):
                 stack.extend(reversed(top.named_children))
