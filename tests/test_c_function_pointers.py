@@ -6,9 +6,9 @@ call expression, so such a function had no caller in the graph. Now an
 identifier naming a function on an assignment's right side, in an initializer,
 as a call argument, in a `return` or as an `==`/`!=` operand is an INFERRED
 `indirect_call`. A parameter or local of that name shadows it. A file-level
-table naming a function of its own file becomes a node: from the file node its
-edges would replace the file's `contains` edges, since the graph keeps one
-edge per pair. And a direct call between the same two functions, either way
+table is a node, as every file-scope variable is, and holds those edges: from
+the file node they would replace the file's `contains` edges, since the graph
+keeps one edge per pair. And a direct call between the same two functions, either way
 round, is kept over the indirect edge.
 """
 from __future__ import annotations
@@ -92,10 +92,11 @@ def test_a_table_naming_its_files_functions_is_a_node(tmp_path: Path):
             in {(s, r, t, None, loc) for s, r, t, _c, loc in edges}
 
 
-def test_a_table_of_another_files_functions_stays_with_its_file(tmp_path: Path):
+def test_a_table_of_another_files_functions_is_a_node_too(tmp_path: Path):
+    # every file-scope variable is a node (test_c_globals.py)
     edges, labels = _edges(tmp_path)
-    assert "sOther" not in labels
-    assert ("b.c", "indirect_call", "Task_A()", "collection", "L4") in edges
+    assert "sOther" in labels
+    assert ("sOther", "indirect_call", "Task_A()", "collection", "L4") in edges
 
 
 def test_a_direct_call_is_kept_over_an_indirect_one(tmp_path: Path):

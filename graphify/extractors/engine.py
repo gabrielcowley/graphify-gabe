@@ -2477,13 +2477,34 @@ _C_KEYWORDS = frozenset({
 })
 
 
+# and a capitalised one opening a line before a type and a name, which only a
+# macro can do: `EWRAM_DATA MainCallback gX`, `COMMON_DATA const struct X *g`.
+# (`BOOL x;` and `BOOL const x;` are a type and a name, and stay.)
+_C_LEADING_MACRO = re.compile(
+    rb"(?m)^([ \t]*(?:(?:static|const)[ \t]+)*)([A-Z][A-Z0-9_]*)"
+    rb"(?=[ \t]+(?:(?:const|volatile)[ \t]+)?(?!(?:const|volatile)\b)[A-Za-z_]\w*[ \t*]+\**[A-Za-z_])")
+
+
+# and a capitalised function-like one there, after at most two words, before
+# a name: `static EWRAM_DATA ALIGNED(4) u8 sX`, `EWRAM_DATA u16 ALIGNED(4)
+# gX[2]`. Left in, the first swallows the file's next few hundred lines into
+# one function.
+_C_ATTRIBUTE_CALL = re.compile(
+    rb"(?m)^([ \t]*(?:(?:static|const)[ \t]+)*(?:[A-Za-z_]\w*[ \t]+){0,2})"
+    rb"([A-Z][A-Z0-9_]*\([^()\n]*\))(?=[ \t]+\**[A-Za-z_])")
+
+
 def _c_blank_attribute_macros(source: bytes) -> bytes:
     """`source` with each such macro replaced by spaces of its length, so every
     offset and line stays the same."""
     def blank(m):
         word = m.group(1)
         return m.group(0) if word in _C_KEYWORDS else b" " * len(word)
-    return _C_ATTRIBUTE_MACRO.sub(blank, source)
+
+    def blank_leading(m):
+        return m.group(1) + b" " * len(m.group(2))
+    source = _C_ATTRIBUTE_CALL.sub(blank_leading, source)
+    return _C_LEADING_MACRO.sub(blank_leading, _C_ATTRIBUTE_MACRO.sub(blank, source))
 
 
 def _c_anonymous_type_name(type_node, source: bytes) -> str | None:
@@ -2642,6 +2663,40 @@ def _c_field_access(node) -> str:
     if parent.type == "update_expression":
         return "writes"
     return "reads"
+
+
+def _c_global_use(node, source: bytes) -> str | None:
+    """`writes` or `reads` when a C identifier in a body may name a global, None
+    when it cannot: a macro or enumerator spelled in capitals. A call through
+    it (`sCallback()`) reads it; a function's name matches no global. Changing the variable's own storage is a write, through `[i]`, `.`
+    and parentheses (`gTasks[id].func = f` writes `gTasks`); through `->` or `*`
+    it is the pointer that is read (`gSaveBlock2Ptr->playerGender = 1`)."""
+    parent = node.parent
+    if parent is None:
+        return None
+    if _C_CAPITALS.match(_read_text(node, source)):
+        return None
+    cur = node
+    while parent is not None:
+        if parent.type == "subscript_expression" and parent.child_by_field_name("argument") == cur:
+            pass
+        elif parent.type == "field_expression" and parent.child_by_field_name("argument") == cur:
+            op = parent.child_by_field_name("operator")
+            if op is not None and op.type == "->":
+                return "reads"
+        elif parent.type != "parenthesized_expression":
+            break
+        cur, parent = parent, parent.parent
+    if parent is None:
+        return "reads"
+    if parent.type == "assignment_expression" and parent.child_by_field_name("left") == cur:
+        return "writes"
+    if parent.type == "update_expression":
+        return "writes"
+    return "reads"
+
+
+_C_CAPITALS = re.compile(r"^[A-Z0-9_]+$")
 
 
 def _c_local_bound_names(func_def_node, source: bytes) -> set[str]:
@@ -6640,6 +6695,9 @@ def _extract_generic(
     # (a field's type, a function's return type, the file's globals).
     c_local_types: dict[str, dict[str, str]] = {}
     c_field_accesses: list[dict] = []
+    # the globals each function names: (caller, name) -> its use, a write kept
+    # over a read
+    c_global_uses: dict[tuple[str, str], dict] = {}
     c_node_markers: dict[str, dict] = {}
     c_type_labels: dict[str, str] = {}  # a C type's label, for its fields' `Type.field`
     if config.ts_module == "tree_sitter_c":
@@ -10629,6 +10687,25 @@ def _extract_generic(
                     "source_location": f"L{field.start_point[0] + 1}",
                 })
 
+        # C globals: a name not bound in the function may be one, as the corpus
+        # pass decides
+        if config.ts_module == "tree_sitter_c" and node.type == "identifier" \
+                and caller_nid in c_local_types:
+            name = _read_text(node, source)
+            access = None if name in local_bound_names.get(caller_nid, frozenset()) \
+                else _c_global_use(node, source)
+            if access is not None:
+                key = (caller_nid, name)
+                seen = c_global_uses.get(key)
+                if seen is None or (access == "writes" and seen["access"] == "reads"):
+                    c_global_uses[key] = {
+                        "caller_nid": caller_nid,
+                        "c_global": name,
+                        "access": access,
+                        "source_file": str_path,
+                        "source_location": f"L{node.start_point[0] + 1}",
+                    }
+
         # C function pointers: a function named as a value in a body (assigned to
         # a callback, passed to CreateTask, listed in a local table, returned or
         # compared) is an indirect dependency of the function naming it, through
@@ -10867,6 +10944,40 @@ def _extract_generic(
         # prototyped here), the variable becomes a node holding those edges: the
         # graph keeps one edge per pair, so from the file node they would
         # replace its `contains` edges. Otherwise the file node holds them.
+        # A variable the file defines at file scope is a node: not an `extern`
+        # declaration, a prototype, a typedef, or a header's `T x;` without a
+        # value.
+        c_var_nids: dict[str, str] = {}
+        stack = list(reversed(root.named_children))
+        while stack:
+            top = stack.pop()
+            if top.type == "declaration":
+                storage = {_read_text(c, source) for c in top.children
+                           if c.type == "storage_class_specifier"}
+                if "extern" in storage:
+                    continue
+                for d in top.children_by_field_name("declarator"):
+                    # a header's `T x;` declares what a .c defines
+                    if d.type != "init_declarator" and str_path.endswith(".h"):
+                        continue
+                    name = _c_declared_name(
+                        d.child_by_field_name("declarator") if d.type == "init_declarator" else d,
+                        source)
+                    if not name or name in c_var_nids or name in c_defined_functions:
+                        continue
+                    nid = _make_id(stem, name)
+                    if nid in seen_ids:
+                        continue
+                    line = d.start_point[0] + 1
+                    add_node(nid, name, line)
+                    add_edge(file_nid, nid, "contains", line)
+                    c_var_nids[name] = nid
+                    c_node_markers.setdefault(nid, {})["_c_var"] = \
+                        "static" if "static" in storage else "global"
+            elif top.type.startswith("preproc_") or top.type in ("linkage_specification",
+                                                                  "declaration_list"):
+                stack.extend(reversed(top.named_children))
+
         c_prototypes: set[str] = set()
         for top in root.named_children:
             if top.type == "declaration":
@@ -10882,7 +10993,28 @@ def _extract_generic(
                 idents = list(_c_ref_value_idents(n.child_by_field_name("value"), source))
                 scope = file_nid
                 name = _c_declared_name(n.child_by_field_name("declarator"), source)
-                if name and any(
+                if name in c_var_nids:
+                    scope = c_var_nids[name]
+                    # the globals its initializer names: `sAnims[] = { sAnim_X }`
+                    line = n.start_point[0] + 1
+                    vstack = [n.child_by_field_name("value")]
+                    while vstack:
+                        v = vstack.pop()
+                        if v is None:
+                            continue
+                        if v.type == "identifier":
+                            ref = _read_text(v, source)
+                            if not _C_CAPITALS.match(ref):
+                                c_global_uses.setdefault((scope, ref), {
+                                    "caller_nid": scope,
+                                    "c_global": ref,
+                                    "access": "reads",
+                                    "source_file": str_path,
+                                    "source_location": f"L{v.start_point[0] + 1}",
+                                })
+                            continue
+                        vstack.extend(v.named_children)
+                elif name and any(
                     _read_text(i, source) in c_prototypes
                     or label_to_nid.get(_read_text(i, source)) in callable_def_nids
                     for i in idents
@@ -10974,6 +11106,9 @@ def _extract_generic(
             if marks:
                 n.update(marks)
     result = {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    # the globals ride with the field accesses, for every id remap and cache
+    # path they take
+    c_field_accesses.extend(c_global_uses.values())
     if c_field_accesses:
         result["c_field_accesses"] = c_field_accesses
     # Export the per-file field->type tables for the corpus member-call

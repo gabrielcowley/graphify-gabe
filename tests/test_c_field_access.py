@@ -122,3 +122,25 @@ def test_an_unchanged_header_still_types_a_changed_file(tmp_path: Path):
     assert ("Heal()", "writes", "Pos.x") in got
     assert ("Heal()", "writes", "Task.data") in got
     assert ("Move()", "writes", "Pos.x") in got   # through the header's `#define pX x`
+
+
+def test_a_global_whose_own_type_is_a_typedef_name_takes_the_headers(tmp_path: Path):
+    # `COMMON_DATA LINK_MANAGER lman` in its .c, `extern struct linkManagerTag
+    # lman` in the header: LINK_MANAGER names no type node, the struct does
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "lman.h").write_text(
+        "typedef struct linkManagerTag { int state; } LINK_MANAGER;\n"
+        "extern struct linkManagerTag lman;\n", encoding="utf-8")
+    (src / "lman.c").write_text(
+        '#include "lman.h"\nCOMMON_DATA LINK_MANAGER lman = {0};\n'
+        "void Reset(void) { lman.state = 0; }\n", encoding="utf-8")
+    (src / "rfu.c").write_text(
+        '#include "lman.h"\nint State(void) { return lman.state; }\n', encoding="utf-8")
+    files = [src / "lman.h", src / "lman.c", src / "rfu.c"]
+    r = extract(files, root=tmp_path, cache_root=tmp_path / "out")
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    got = {(labels[e["source"]], e["relation"], labels[e["target"]])
+           for e in r["edges"] if e.get("context") == "field"}
+    assert ("Reset()", "writes", "linkManagerTag.state") in got
+    assert ("State()", "reads", "linkManagerTag.state") in got
