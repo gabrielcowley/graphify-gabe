@@ -2040,6 +2040,8 @@ def _rebuild_code(
                         "_ts_fields", "_ts_static_fields",
                         "_py_fixture",
                         "_rust_ret", "_rust_ret_ok", "_rust_fields", "_rust_field", "_rust_field_holds",
+                        "_c_globals", "_c_ret", "_c_field", "_c_field_type", "_c_field_type_nested",
+                        "_c_field_macros", "_c_macros", "_c_returns",
                     ):
                         if node.get(marker):
                             ctx_node[marker] = node[marker]
@@ -2082,7 +2084,7 @@ def _rebuild_code(
                 # typed by that file's imports, as in a full build.
                 for edge in ctx_graph.get("links", ctx_graph.get("edges", [])):
                     if edge.get("relation") not in (
-                        "contains", "method", "inherits", "imports", "imports_from", "case_of"
+                        "contains", "method", "inherits", "imports", "imports_from", "case_of", "defines"
                     ):
                         continue
                     if not _is_ast_tier(edge):
