@@ -1301,6 +1301,11 @@ def _get_c_func_name(node, source: bytes) -> str | None:
     decl = node.child_by_field_name("declarator")
     if decl:
         return _get_c_func_name(decl, source)
+    if node.type == "parenthesized_declarator":
+        # a function returning a function pointer, `void (*GetGfxFunc(void))(void)`:
+        # the name is inside the parentheses, which have no `declarator` field
+        inner = next(iter(node.named_children), None)
+        return _get_c_func_name(inner, source) if inner is not None else None
     for child in node.children:
         if child.type == "identifier":
             return _read_text(child, source)
