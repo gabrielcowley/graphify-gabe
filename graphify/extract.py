@@ -7516,7 +7516,9 @@ def _resolve_c_global_uses(uses, nodes, all_edges) -> None:
     `.c` of that name, else the one under the use's top directory; a local or
     parameter of the name was left out in the file, and another file's `static`
     one is never it. Changing the variable's own
-    storage is a write (`gTasks[id].func = f`), anything else a read, a pointer
+    storage is a write (`gTasks[id].func = f`), passing its address where a
+    call stores too (`CpuFill16(0, &gX, n)`), and passing it there itself
+    (`fills`) when it is an array (`_c_array`); anything else a read, a pointer
     followed by `->` included. A global whose initializer names another
     (`sAnims[] = { sAnim_X }`) `references` it. INFERRED; one edge per pair.
     """
@@ -7524,12 +7526,15 @@ def _resolve_c_global_uses(uses, nodes, all_edges) -> None:
         return
     file_of: dict[str, str] = {}
     statics: dict[str, str] = {}
+    arrays: set[str] = set()
     by_name: dict[str, list[str]] = {}
     for n in nodes:
         nid = n.get("id")
         if not nid or not n.get("_c_var"):
             continue
         statics[str(nid)] = str(n["_c_var"])
+        if n.get("_c_array"):
+            arrays.add(str(nid))
         file_of[str(nid)] = str(n.get("source_file") or "").replace("\\", "/")
         ids = by_name.setdefault(str(n.get("label") or ""), [])
         if nid not in ids:
@@ -7567,7 +7572,10 @@ def _resolve_c_global_uses(uses, nodes, all_edges) -> None:
         target = pick(str(use["c_global"]), from_file)
         if target is None or target == caller:
             continue
-        relation = "writes" if use.get("access") == "writes" else "reads"
+        access = use.get("access")
+        if access == "fills":  # passed where a call stores: written only if an array
+            access = "writes" if target in arrays else "reads"
+        relation = "writes" if access == "writes" else "reads"
         if caller in statics:  # a global's initializer naming another
             relation = "references"
         existing = by_pair.get((caller, target))
@@ -7743,7 +7751,10 @@ def _resolve_c_field_accesses(accesses, nodes, all_edges, context_edges) -> None
         field_nid = field_of(decl, str(fa["field"]), from_file) if decl else None
         if field_nid is None:
             continue
-        relation = "writes" if fa.get("access") == "writes" else "reads"
+        access = fa.get("access")
+        if access == "fills":  # passed where a call stores: written only if an array
+            access = "writes" if by_id.get(field_nid, {}).get("_c_array") else "reads"
+        relation = "writes" if access == "writes" else "reads"
         existing = by_pair.get((caller, field_nid))
         if existing is not None:
             if existing["relation"] == relation:

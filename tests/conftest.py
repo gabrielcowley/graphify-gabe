@@ -62,6 +62,7 @@ def _sandbox_home(tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)     # escape hatch that bypasses Path.home
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)        # the lookup cache, too
+    monkeypatch.delenv("GRAPHIFY_QUERY_LOG", raising=False)    # a session's own query log
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     return home
 
