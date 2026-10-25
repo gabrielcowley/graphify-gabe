@@ -7503,6 +7503,87 @@ def _resolve_rust_typed_member_calls(
         })
 
 
+def _resolve_c_global_uses(uses, nodes, all_edges) -> None:
+    """Bind each name a C function uses to the global variable it names.
+
+    A global is a file-scope variable its file defines (`_c_var`). The name is
+    the using file's own when it defines one, else the one definition in a
+    `.c` of that name, else the one under the use's top directory; a local or
+    parameter of the name was left out in the file, and another file's `static`
+    one is never it. Changing the variable's own
+    storage is a write (`gTasks[id].func = f`), anything else a read, a pointer
+    followed by `->` included. A global whose initializer names another
+    (`sAnims[] = { sAnim_X }`) `references` it. INFERRED; one edge per pair.
+    """
+    if not uses:
+        return
+    file_of: dict[str, str] = {}
+    statics: dict[str, str] = {}
+    by_name: dict[str, list[str]] = {}
+    for n in nodes:
+        nid = n.get("id")
+        if not nid or not n.get("_c_var"):
+            continue
+        statics[str(nid)] = str(n["_c_var"])
+        file_of[str(nid)] = str(n.get("source_file") or "").replace("\\", "/")
+        ids = by_name.setdefault(str(n.get("label") or ""), [])
+        if nid not in ids:
+            ids.append(str(nid))
+    if not by_name:
+        return
+    caller_file = {str(n.get("id")): str(n.get("source_file") or "").replace("\\", "/")
+                   for n in nodes if n.get("id")}
+
+    def pick(name: str, from_file: str) -> str | None:
+        defs = by_name.get(name, [])
+        if not defs:
+            return None
+        own = [d for d in defs if file_of[d] == from_file]
+        if own:
+            return own[0] if len(own) == 1 else None
+        # a `static` one in another file is not this one
+        defs = [d for d in defs if statics.get(d) != "static"]
+        if len(defs) == 1:
+            return defs[0]
+        in_c = [d for d in defs if file_of[d].endswith(".c")]
+        if len(in_c) == 1:
+            return in_c[0]
+        top = from_file.split("/", 1)[0]
+        near = [d for d in (in_c or defs) if file_of[d].split("/", 1)[0] == top]
+        return near[0] if len(near) == 1 else None
+
+    by_pair: dict[tuple[str, str], dict] = {
+        (str(e.get("source")), str(e.get("target"))): e
+        for e in all_edges if e.get("relation") in ("reads", "writes", "references")
+    }
+    for use in uses:
+        caller = str(use["caller_nid"])
+        from_file = caller_file.get(caller) or str(use.get("source_file", "")).replace("\\", "/")
+        target = pick(str(use["c_global"]), from_file)
+        if target is None or target == caller:
+            continue
+        relation = "writes" if use.get("access") == "writes" else "reads"
+        if caller in statics:  # a global's initializer naming another
+            relation = "references"
+        existing = by_pair.get((caller, target))
+        if existing is not None:
+            if existing["relation"] == "reads" and relation == "writes":
+                existing.update(relation="writes", source_location=use.get("source_location"))
+            continue
+        by_pair[(caller, target)] = edge = {
+            "source": caller,
+            "target": target,
+            "relation": relation,
+            "context": "global",
+            "confidence": "INFERRED",
+            "confidence_score": 0.85,
+            "source_file": use.get("source_file", ""),
+            "source_location": use.get("source_location"),
+            "weight": 1.0,
+        }
+        all_edges.append(edge)
+
+
 def _resolve_c_field_accesses(accesses, nodes, all_edges, context_edges) -> None:
     """Bind each C `x.f` / `x->f` read or write to the field node of the struct
     the receiver's type names.
@@ -7620,11 +7701,16 @@ def _resolve_c_field_accesses(accesses, nodes, all_edges, context_edges) -> None
             return str(desc["t"])
         if "g" in desc:
             own = globals_by_file.get(from_file, {}).get(desc["g"])
-            if own:
+            # the file's own declaration, unless its type is a typedef name no
+            # type goes by (`LINK_MANAGER lman` for `struct linkManagerTag`)
+            if own and decl_of(own, from_file):
                 return own
-            agreed = global_types.get(desc["g"], set())
+            agreed = {t for t in global_types.get(desc["g"], set())
+                      if t != own and decl_of(t, from_file)}
             if len(agreed) == 1:
                 return next(iter(agreed))
+            if own:
+                return own
             # `eContest`, `#define`d as `(*gContestResources->contest)`
             macro = macros_by_file.get(from_file, {}).get(desc["g"])
             if macro is None and len(macros.get(desc["g"], [])) == 1:
@@ -11456,6 +11542,11 @@ def extract(
         [fa for fa in all_field_accesses if "c_receiver" in fa],
         [*all_nodes, *(resolution_context_nodes or [])],
         all_edges, [*(resolution_context_edges or [])],
+    )
+    _resolve_c_global_uses(
+        [fa for fa in all_field_accesses if "c_global" in fa],
+        [*all_nodes, *(resolution_context_nodes or [])],
+        all_edges,
     )
 
     # Go: repoint intra-module `imports_from` edges from the synthetic

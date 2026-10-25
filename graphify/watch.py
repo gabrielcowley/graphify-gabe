@@ -2041,7 +2041,7 @@ def _rebuild_code(
                         "_py_fixture",
                         "_rust_ret", "_rust_ret_ok", "_rust_fields", "_rust_field", "_rust_field_holds",
                         "_c_globals", "_c_ret", "_c_field", "_c_field_type", "_c_field_type_nested",
-                        "_c_field_macros", "_c_macros", "_c_returns",
+                        "_c_field_macros", "_c_macros", "_c_returns", "_c_var",
                     ):
                         if node.get(marker):
                             ctx_node[marker] = node[marker]
