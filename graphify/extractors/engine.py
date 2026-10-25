@@ -6641,6 +6641,7 @@ def _extract_generic(
     c_local_types: dict[str, dict[str, str]] = {}
     c_field_accesses: list[dict] = []
     c_node_markers: dict[str, dict] = {}
+    c_type_labels: dict[str, str] = {}  # a C type's label, for its fields' `Type.field`
     if config.ts_module == "tree_sitter_c":
         for top in root.named_children:
             if top.type == "function_definition":
@@ -6863,6 +6864,8 @@ def _extract_generic(
                     metadata = dict(metadata or {})
                     metadata["python_opaque_bases"] = True
             add_node(class_nid, class_name, line, metadata=metadata)
+            if config.ts_module == "tree_sitter_c":
+                c_type_labels.setdefault(class_nid, class_name)
             if config.ts_module == "tree_sitter_ruby" and metadata:
                 # Reopened declarations collapse onto the same file-local id;
                 # merge fail-closed markers that add_node intentionally skips.
@@ -8148,7 +8151,10 @@ def _extract_generic(
                     add_edge(parent_class_nid, member_nid, "method", line)
                     callable_def_nids.add(member_nid)
                 else:
-                    add_node(member_nid, name, line)
+                    # C: `SaveBlock2.playerName`, as Rust's fields are labelled;
+                    # the bare name still matches it (`_c_field`)
+                    owner_label = c_type_labels.get(parent_class_nid) if is_c else None
+                    add_node(member_nid, f"{owner_label}.{name}" if owner_label else name, line)
                     add_edge(parent_class_nid, member_nid, "defines", line, context="field")
                     if is_c:
                         # what `x.name` is, for a chain through it (`a.pos.x`)
