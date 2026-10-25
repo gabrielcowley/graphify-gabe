@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import re
 from graphify.extractors.base import (
     _LANGUAGE_BUILTIN_GLOBALS,
     _file_stem,
@@ -2316,6 +2317,206 @@ def _c_attribute_recovered_name(field_decl, source: bytes) -> str | None:
                     return _read_text(ty, source)
             return ""
     return None
+
+
+def _c_type_name(type_node, source: bytes) -> str | None:
+    """The struct, union, enum or typedef a C declaration's type names, by the
+    label its definition's node has (`struct Sprite` and `Sprite` are both
+    `Sprite`). None for a primitive type."""
+    if type_node is None:
+        return None
+    if type_node.type == "type_identifier":
+        return _read_text(type_node, source)
+    if type_node.type in ("struct_specifier", "union_specifier", "enum_specifier"):
+        name = type_node.child_by_field_name("name")
+        if name is not None:
+            return _read_text(name, source)
+        return _c_anonymous_type_name(type_node, source)
+    if type_node.type == "type_descriptor":
+        return _c_type_name(type_node.child_by_field_name("type"), source)
+    return None
+
+
+# An identifier straight before one of these keywords can only be a macro: no
+# C declaration puts a name there (`u8 const` can, so `const` is not one). GBA code uses such macros for attributes,
+# `static EWRAM_DATA struct { … } *sX`, which tree-sitter reads as a function
+# named `struct`.
+_C_ATTRIBUTE_MACRO = re.compile(
+    rb"(?<![\w.>])([A-Za-z_]\w*)(?=[ \t]+(?:struct|union|enum|static|extern)\b)")
+_C_KEYWORDS = frozenset({
+    b"typedef", b"static", b"extern", b"const", b"volatile", b"register", b"auto",
+    b"inline", b"struct", b"union", b"enum", b"return", b"sizeof", b"case", b"else",
+    b"do", b"goto", b"restrict", b"_Noreturn", b"__inline", b"__inline__", b"signed",
+    b"unsigned", b"void", b"char", b"short", b"int", b"long", b"float", b"double",
+    b"_Bool",
+})
+
+
+def _c_blank_attribute_macros(source: bytes) -> bytes:
+    """`source` with each such macro replaced by spaces of its length, so every
+    offset and line stays the same."""
+    def blank(m):
+        word = m.group(1)
+        return m.group(0) if word in _C_KEYWORDS else b" " * len(word)
+    return _C_ATTRIBUTE_MACRO.sub(blank, source)
+
+
+def _c_anonymous_type_name(type_node, source: bytes) -> str | None:
+    """The name an anonymous C struct, union or enum takes from what it
+    declares: `struct { … } *sTradeAnim` is the type `sTradeAnim`, a field's
+    `union { … } u` the type `u`. None for any other."""
+    parent = type_node.parent
+    if (type_node.child_by_field_name("body") is None or parent is None
+            or parent.child_by_field_name("type") != type_node):
+        return None
+    first = next(iter(parent.children_by_field_name("declarator")), None)
+    if first is None:
+        return None
+    if parent.type == "declaration":
+        return _c_declared_name(first, source)
+    if parent.type == "field_declaration":
+        return _c_field_name(first, source)
+    return None
+
+
+_C_MACRO_PARSER = None
+
+
+def _c_parse_expression(text: str):
+    """A C expression parsed on its own, for a macro's body; None if it does
+    not parse cleanly."""
+    global _C_MACRO_PARSER
+    if _C_MACRO_PARSER is None:
+        import tree_sitter as _ts
+        import tree_sitter_c as _tsc
+        _C_MACRO_PARSER = _ts.Parser(_ts.Language(_tsc.language()))
+    wrapped = f"void __m(void) {{ ({text}); }}".encode("utf-8", "replace")
+    tree = _C_MACRO_PARSER.parse(wrapped)
+    if tree.root_node.has_error:
+        return None, wrapped
+    stmt = tree.root_node.named_children[0].child_by_field_name("body").named_children[0]
+    expr = stmt.named_children[0]
+    while expr.type == "parenthesized_expression" and expr.named_children:
+        expr = expr.named_children[0]
+    return expr, wrapped
+
+
+def _c_object_macros(root, source: bytes) -> tuple[dict[str, str], dict[str, dict]]:
+    """A C file's object-like macros that stand for a field or a receiver:
+    `#define tState data[0]` is the field `data` (`gTasks[id].tState`), and
+    `#define eContest (*gContestResources->contest)` the receiver it expands
+    to, as `_c_receiver` describes one."""
+    fields: dict[str, str] = {}
+    receivers: dict[str, dict] = {}
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "function_definition":
+            continue
+        if n.type == "preproc_def":
+            name, value = n.child_by_field_name("name"), n.child_by_field_name("value")
+            if name is not None and value is not None:
+                macro, body = _read_text(name, source), _read_text(value, source).strip()
+                m = re.match(r"^([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$", body)
+                if m:
+                    fields[macro] = m.group(1)
+                expr, text = _c_parse_expression(body)
+                if expr is not None and expr.type != "identifier":
+                    desc = _c_receiver(expr, text, {})
+                    if desc is not None:
+                        receivers[macro] = desc
+            continue
+        stack.extend(n.named_children)
+    return fields, receivers
+
+
+def _c_declared_types(decl_node, source: bytes) -> dict[str, str]:
+    """name -> type for the variables a C `declaration` or
+    `parameter_declaration` declares with a named type: `struct Sprite *sprite`
+    is `sprite: Sprite`, `struct Task gTasks[16]` is `gTasks: Task`. A pointer
+    or array of the type is the type, since `->`, `.` and `[]` all reach its
+    fields. A function pointer's type is its return type's, and is left out."""
+    tname = _c_type_name(decl_node.child_by_field_name("type"), source)
+    if not tname:
+        return {}
+    out: dict[str, str] = {}
+    for d in decl_node.children_by_field_name("declarator"):
+        probe, is_fn = d, False
+        while probe is not None:
+            if probe.type == "function_declarator":
+                is_fn = True
+                break
+            probe = probe.child_by_field_name("declarator")
+        if is_fn:
+            continue
+        name = _c_declared_name(d, source)
+        if name:
+            out[name] = tname
+    return out
+
+
+def _c_local_types(func_def_node, source: bytes) -> dict[str, str]:
+    """The parameters and locals of a C function that have a named type."""
+    out: dict[str, str] = {}
+    stack = [func_def_node]
+    while stack:
+        n = stack.pop()
+        if n.type in ("parameter_declaration", "declaration"):
+            out.update(_c_declared_types(n, source))
+        stack.extend(n.children)
+    return out
+
+
+def _c_receiver(node, source: bytes, local_types: dict[str, str]):
+    """What the left of a C `.` or `->` is, for the corpus pass to type: a
+    local or parameter's type (`{"t": T}`), a global by name (`{"g": name}`), a
+    field of another receiver (`{"field": name, "of": ...}`), a function's
+    return (`{"ret": name}`) or a cast's type. `[i]`, `*`, `&` and parentheses
+    keep the receiver's type. None when it is none of these."""
+    if node is None:
+        return None
+    t = node.type
+    if t == "identifier":
+        name = _read_text(node, source)
+        return {"t": local_types[name]} if name in local_types else {"g": name}
+    if t == "field_expression":
+        inner = _c_receiver(node.child_by_field_name("argument"), source, local_types)
+        field = node.child_by_field_name("field")
+        if inner is None or field is None:
+            return None
+        return {"field": _read_text(field, source), "of": inner}
+    if t in ("subscript_expression", "pointer_expression"):
+        return _c_receiver(node.child_by_field_name("argument"), source, local_types)
+    if t == "parenthesized_expression":
+        inner = next(iter(node.named_children), None)
+        return _c_receiver(inner, source, local_types)
+    if t == "cast_expression":
+        tname = _c_type_name(node.child_by_field_name("type"), source)
+        return {"t": tname} if tname else None
+    if t == "call_expression":
+        fn = node.child_by_field_name("function")
+        if fn is not None and fn.type == "identifier":
+            return {"ret": _read_text(fn, source)}
+    return None
+
+
+def _c_field_access(node) -> str:
+    """`writes` when a C field expression is assigned or incremented, through
+    `[i]` and parentheses (`gTasks[id].data[0] = 1` writes `data`), else
+    `reads`."""
+    cur, parent = node, node.parent
+    while parent is not None and (
+        (parent.type == "subscript_expression" and parent.child_by_field_name("argument") == cur)
+        or parent.type == "parenthesized_expression"
+    ):
+        cur, parent = parent, parent.parent
+    if parent is None:
+        return "reads"
+    if parent.type == "assignment_expression" and parent.child_by_field_name("left") == cur:
+        return "writes"
+    if parent.type == "update_expression":
+        return "writes"
+    return "reads"
 
 
 def _c_local_bound_names(func_def_node, source: bytes) -> set[str]:
@@ -5988,6 +6189,8 @@ def _extract_generic(
         # char is added only if the original file does not end with it.
         if source and not source.endswith(b"\n"):
             source = source + b"\n"
+        if config.ts_module == "tree_sitter_c":
+            source = _c_blank_attribute_macros(source)
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:
@@ -6225,6 +6428,12 @@ def _extract_generic(
     # (`struct CableCar` and `CableCar()` in cable_car.c) gets an id of its own
     # rather than taking the function's.
     c_defined_functions: set[str] = set()
+    # C field reads and writes: each function's typed locals, the receiver of
+    # each `x.f` / `x->f`, and the type facts the corpus pass types them with
+    # (a field's type, a function's return type, the file's globals).
+    c_local_types: dict[str, dict[str, str]] = {}
+    c_field_accesses: list[dict] = []
+    c_node_markers: dict[str, dict] = {}
     if config.ts_module == "tree_sitter_c":
         for top in root.named_children:
             if top.type == "function_definition":
@@ -6310,13 +6519,16 @@ def _extract_generic(
                 # dropped (or leaking to file scope) (#4130).
                 if config.ts_module == "tree_sitter_scala" and t == "given_definition":
                     synthetic_name = _scala_given_synthetic_name(node, source)
-                # C: `typedef struct { … } Name;` is the type `Name`.
+                # C: `typedef struct { … } Name;` is the type `Name`, and
+                # `struct { … } *sTradeAnim` the type `sTradeAnim`.
                 if (config.ts_module == "tree_sitter_c" and node.parent is not None
                         and node.parent.type == "type_definition"
                         and node.child_by_field_name("body") is not None):
                     alias = node.parent.child_by_field_name("declarator")
                     if alias is not None and alias.type == "type_identifier":
                         synthetic_name = _read_text(alias, source)
+                elif config.ts_module == "tree_sitter_c":
+                    synthetic_name = _c_anonymous_type_name(node, source)
                 if not synthetic_name:
                     return
             if config.ts_module == "tree_sitter_c" and node.child_by_field_name("body") is None:
@@ -6350,6 +6562,11 @@ def _extract_generic(
             class_nid = _make_id(stem, ".".join(namespace_stack), class_name_for_id)
             if config.ts_module == "tree_sitter_c" and class_name in c_defined_functions:
                 class_nid = _make_id(stem, class_name_for_id, "type")
+            if (config.ts_module == "tree_sitter_c" and parent_class_nid
+                    and name_node is None):
+                # a field's anonymous `union { … } u`: its parent's, since
+                # another struct may have a `u` of its own
+                class_nid = _make_id(parent_class_nid, "type", class_name_for_id)
             if config.ts_module == "tree_sitter_c_sharp":
                 # `Pair` / `_Pair` in one file share an id otherwise (#4415).
                 class_nid = _underscore_salted_nid(class_nid, class_name, csharp_type_groups)
@@ -7710,7 +7927,10 @@ def _extract_generic(
                 if not name:
                     continue
                 line = decl.start_point[0] + 1
-                member_nid = _make_id(parent_class_nid, name)
+                # C: `struct BattleTv`'s field `side` and `struct BattleTv_Side`
+                # would share `..._battletv_side`, losing one of the two
+                member_nid = (_make_id(parent_class_nid, "field", name) if is_c
+                              else _make_id(parent_class_nid, name))
                 decl_is_method = not is_c and (
                     decl.type == "function_declarator"
                     or (decl.type in ("pointer_declarator", "reference_declarator")
@@ -7723,6 +7943,20 @@ def _extract_generic(
                 else:
                     add_node(member_nid, name, line)
                     add_edge(parent_class_nid, member_nid, "defines", line, context="field")
+                    if is_c:
+                        # what `x.name` is, for a chain through it (`a.pos.x`)
+                        ftype_node = node.child_by_field_name("type")
+                        marks = c_node_markers.setdefault(member_nid, {})
+                        marks["_c_field"] = name
+                        if (is_nested_type and ftype_node is not None
+                                and ftype_node.child_by_field_name("name") is None):
+                            # its anonymous type, the parent's `type` of this name;
+                            # ids are rewritten after extraction, so by name
+                            marks["_c_field_type_nested"] = name
+                        else:
+                            ftype = _c_type_name(ftype_node, source)
+                            if ftype:
+                                marks["_c_field_type"] = ftype
             return
 
         # Ruby's `class << self` contains ordinary `method` nodes. Keep them
@@ -7875,6 +8109,10 @@ def _extract_generic(
                 local_bound_names[func_nid] = _js_local_bound_names(node, source)
             elif config.ts_module == "tree_sitter_c":
                 local_bound_names[func_nid] = _c_local_bound_names(node, source)
+                c_local_types[func_nid] = _c_local_types(node, source)
+                ret = _c_type_name(node.child_by_field_name("type"), source)
+                if ret:
+                    c_node_markers.setdefault(func_nid, {})["_c_ret"] = ret
 
             if config.ts_module == "tree_sitter_python":
                 params_node = node.child_by_field_name("parameters")
@@ -10114,6 +10352,21 @@ def _extract_generic(
             for ident in _js_dispatch_value_idents(node):
                 _emit_indirect_ref(ident, caller_nid, enclosing_locals, "collection")
 
+        # C field reads and writes: the receiver is typed by the corpus pass
+        if config.ts_module == "tree_sitter_c" and node.type == "field_expression":
+            field = node.child_by_field_name("field")
+            receiver = _c_receiver(node.child_by_field_name("argument"), source,
+                                   c_local_types.get(caller_nid, {}))
+            if field is not None and receiver is not None:
+                c_field_accesses.append({
+                    "caller_nid": caller_nid,
+                    "c_receiver": receiver,
+                    "field": _read_text(field, source),
+                    "access": _c_field_access(node),
+                    "source_file": str_path,
+                    "source_location": f"L{field.start_point[0] + 1}",
+                })
+
         # C function pointers: a function named as a value in a body (assigned to
         # a callback, passed to CreateTask, listed in a local table, returned or
         # compared) is an indirect dependency of the function naming it, through
@@ -10414,7 +10667,53 @@ def _extract_generic(
         raw_calls.extend(_python_property_reads(
             function_bodies, source, str_path, python_var_types, python_attr_types, method_owner,
         ))
+    if config.ts_module == "tree_sitter_c":
+        # The file's globals with a named type, on its file node: `extern
+        # struct SaveBlock2 *gSaveBlock2Ptr;` in a header, `static EWRAM_DATA
+        # struct Menu *sMenu` in a .c (the parser splits that one in two, the
+        # second half naming the type by its tag, which is all that is read).
+        c_globals: dict[str, str] = {}
+        c_returns: dict[str, str] = {}  # a prototype's: `struct Mon *GetMon(void);`
+        stack = list(root.named_children)
+        while stack:
+            top = stack.pop()
+            if top.type == "function_definition":
+                continue
+            if top.type == "declaration":
+                # `EWRAM_DATA u8 gX;` parses with the macro as the type and an
+                # ERROR after it: no type to read from it
+                if not any(c.type == "ERROR" for c in top.children) and not any(
+                        _read_text(d, source) == "struct"
+                        for d in top.children_by_field_name("declarator")):
+                    c_globals.update(_c_declared_types(top, source))
+                    ret = _c_type_name(top.child_by_field_name("type"), source)
+                    for d in top.children_by_field_name("declarator") if ret else ():
+                        while d is not None and d.type == "pointer_declarator":
+                            d = d.child_by_field_name("declarator")
+                        inner = d.child_by_field_name("declarator") if d is not None else None
+                        if d is not None and d.type == "function_declarator" and inner is not None \
+                                and inner.type == "identifier":
+                            c_returns[_read_text(inner, source)] = ret
+                continue
+            if top.type.startswith("preproc_") or top.type in ("linkage_specification",
+                                                                "declaration_list", "ERROR"):
+                stack.extend(top.named_children)
+        if c_globals:
+            c_node_markers.setdefault(file_nid, {})["_c_globals"] = dict(sorted(c_globals.items()))
+        if c_returns:
+            c_node_markers.setdefault(file_nid, {})["_c_returns"] = dict(sorted(c_returns.items()))
+        macro_fields, macro_receivers = _c_object_macros(root, source)
+        if macro_fields:
+            c_node_markers.setdefault(file_nid, {})["_c_field_macros"] = dict(sorted(macro_fields.items()))
+        if macro_receivers:
+            c_node_markers.setdefault(file_nid, {})["_c_macros"] = dict(sorted(macro_receivers.items()))
+        for n in nodes:
+            marks = c_node_markers.get(n.get("id"))
+            if marks:
+                n.update(marks)
     result = {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
+    if c_field_accesses:
+        result["c_field_accesses"] = c_field_accesses
     # Export the per-file field->type tables for the corpus member-call
     # resolvers (#3151): a field declared on a superclass in ANOTHER file can
     # only be typed once the whole graph is visible. Keyed by class label +

@@ -4442,7 +4442,8 @@ def _merge_csharp_partial_class_nodes(
     # cross-file call pass after this merge — a top-level raw call whose caller
     # is a merged-away class half must follow it onto the canonical node.
     for result in per_file:
-        for rc in [*(result.get("raw_calls", []) or []), *(result.get("rust_field_accesses", []) or [])]:
+        for rc in [*(result.get("raw_calls", []) or []), *(result.get("rust_field_accesses", []) or []),
+                   *(result.get("c_field_accesses", []) or [])]:
             cn = rc.get("caller_nid")
             if cn in remap:
                 rc["caller_nid"] = remap[cn]
@@ -7502,6 +7503,181 @@ def _resolve_rust_typed_member_calls(
         })
 
 
+def _resolve_c_field_accesses(accesses, nodes, all_edges, context_edges) -> None:
+    """Bind each C `x.f` / `x->f` read or write to the field node of the struct
+    the receiver's type names.
+
+    The receiver comes typed from its file (`extractors/engine.py`'s
+    `_c_receiver`): a local's or parameter's declared type, or a global, a
+    field or a function's return, typed here from the corpus's `_c_globals`,
+    `_c_field_type` and `_c_ret`/`_c_returns` markers. A global is the accessing file's own
+    declaration when it has one, else the one type every declaration of it
+    agrees on, else an object-like macro standing for a receiver (`eContest`
+    for `(*gContestResources->contest)`, `_c_macros`). A field name may be a
+    macro for another (`tState` for `data[0]`, `_c_field_macros`). A type is
+    the accessing file's own definition, else the one definition of that name,
+    else the one under the access's top directory; a field's anonymous union is
+    the one its struct owns. Nothing that does not narrow to one adds an edge.
+    INFERRED, as for a typed call; one edge per (function, field), a read
+    after a write kept as `also_reads`.
+    """
+    if not accesses:
+        return
+    by_id = {str(n.get("id")): n for n in nodes if n.get("id")}
+    file_of = {nid: str(n.get("source_file") or "").replace("\\", "/") for nid, n in by_id.items()}
+    types_by_label: dict[str, list[str]] = {}
+    fields_of: dict[tuple[str, str], str] = {}
+    owner_of: dict[str, str] = {}
+    for e in [*all_edges, *context_edges]:
+        if e.get("relation") != "defines":
+            continue
+        owner, field = by_id.get(str(e.get("source"))), by_id.get(str(e.get("target")))
+        if owner is None or field is None or not field.get("_c_field"):
+            continue
+        fields_of[(str(owner["id"]), str(field["_c_field"]))] = str(field["id"])
+        owner_of[str(field["id"])] = str(owner["id"])
+        ids = types_by_label.setdefault(str(owner.get("label") or ""), [])
+        if owner["id"] not in ids:
+            ids.append(str(owner["id"]))
+    globals_by_file: dict[str, dict[str, str]] = {}
+    global_types: dict[str, set[str]] = {}
+    returns: dict[str, set[str]] = {}
+    # object-like macros: as a field (`tState` -> `data`), as a receiver
+    field_macros_by_file: dict[str, dict[str, str]] = {}
+    field_macros: dict[str, set[str]] = {}
+    macros_by_file: dict[str, dict[str, dict]] = {}
+    macros: dict[str, list[dict]] = {}
+    for nid, n in by_id.items():
+        g = n.get("_c_globals")
+        if isinstance(g, dict):
+            globals_by_file[file_of[nid]] = g
+            for name, t in g.items():
+                global_types.setdefault(name, set()).add(t)
+        fm = n.get("_c_field_macros")
+        if isinstance(fm, dict):
+            field_macros_by_file[file_of[nid]] = fm
+            for name, f in fm.items():
+                field_macros.setdefault(name, set()).add(f)
+        rm = n.get("_c_macros")
+        if isinstance(rm, dict):
+            macros_by_file[file_of[nid]] = rm
+            for name, d in rm.items():
+                seen = macros.setdefault(name, [])
+                if d not in seen:
+                    seen.append(d)
+        if n.get("_c_ret"):
+            returns.setdefault(str(n.get("label") or "").removesuffix("()"), set()).add(str(n["_c_ret"]))
+        if isinstance(n.get("_c_returns"), dict):
+            for name, t in n["_c_returns"].items():
+                returns.setdefault(name, set()).add(str(t))
+
+    def pick(tname: str, from_file: str) -> str | None:
+        decls = types_by_label.get(tname, [])
+        own = [d for d in decls if file_of.get(d) == from_file]
+        if len(own) == 1:
+            return own[0]
+        if len(decls) == 1:
+            return decls[0]
+        # `Image` in the game and in its tools/: the one under the same top
+        # directory as the access
+        top = from_file.split("/", 1)[0]
+        near = [d for d in decls if file_of.get(d, "").split("/", 1)[0] == top]
+        return near[0] if len(near) == 1 else None
+
+    def field_of(decl: str, name: str, from_file: str) -> str | None:
+        fid = fields_of.get((decl, name))
+        if fid is not None:
+            return fid
+        # `gTasks[id].tState` with `#define tState data[0]`
+        alias = field_macros_by_file.get(from_file, {}).get(name)
+        if alias is None:
+            agreed = field_macros.get(name, set())
+            alias = next(iter(agreed)) if len(agreed) == 1 else None
+        return fields_of.get((decl, alias)) if alias else None
+
+    def field_type(fid: str, from_file: str) -> str | None:
+        field = by_id[fid]
+        nested = field.get("_c_field_type_nested")
+        if nested:
+            # a field's anonymous `union { … } u`: the type `u` its struct owns
+            owner = owner_of.get(fid, "")
+            own = [d for d in types_by_label.get(str(nested), [])
+                   if d.startswith(owner + "_type_")]
+            return "#" + own[0] if len(own) == 1 else None
+        return str(field.get("_c_field_type") or "") or None
+
+    def decl_of(tname: str | None, from_file: str) -> str | None:
+        if not tname:
+            return None
+        if tname.startswith("#"):  # a field's anonymous type, by id
+            return tname[1:] if tname[1:] in by_id else None
+        return pick(tname, from_file)
+
+    def type_of(desc, from_file: str, depth: int = 0) -> str | None:
+        if not isinstance(desc, dict) or depth > 12:
+            return None
+        if "t" in desc:
+            return str(desc["t"])
+        if "g" in desc:
+            own = globals_by_file.get(from_file, {}).get(desc["g"])
+            if own:
+                return own
+            agreed = global_types.get(desc["g"], set())
+            if len(agreed) == 1:
+                return next(iter(agreed))
+            # `eContest`, `#define`d as `(*gContestResources->contest)`
+            macro = macros_by_file.get(from_file, {}).get(desc["g"])
+            if macro is None and len(macros.get(desc["g"], [])) == 1:
+                macro = macros[desc["g"]][0]
+            return type_of(macro, from_file, depth + 1) if macro else None
+        if "ret" in desc:
+            agreed = returns.get(desc["ret"], set())
+            return next(iter(agreed)) if len(agreed) == 1 else None
+        if "field" in desc:
+            decl = decl_of(type_of(desc.get("of"), from_file, depth + 1), from_file)
+            fid = field_of(decl, str(desc["field"]), from_file) if decl else None
+            return field_type(fid, from_file) if fid else None
+        return None
+
+    by_pair: dict[tuple[str, str], dict] = {
+        (str(e.get("source")), str(e.get("target"))): e
+        for e in all_edges if e.get("relation") in ("reads", "writes")
+    }
+    for fa in accesses:
+        caller = str(fa["caller_nid"])
+        source_file = str(fa.get("source_file", "")).replace("\\", "/")
+        from_file = file_of.get(caller) or source_file
+        owner = type_of(fa["c_receiver"], from_file)
+        decl = decl_of(owner, from_file)
+        field_nid = field_of(decl, str(fa["field"]), from_file) if decl else None
+        if field_nid is None:
+            continue
+        relation = "writes" if fa.get("access") == "writes" else "reads"
+        existing = by_pair.get((caller, field_nid))
+        if existing is not None:
+            if existing["relation"] == relation:
+                continue
+            if relation == "reads":
+                existing.setdefault("also_reads", fa.get("source_location"))
+            else:  # a write after a read: the edge becomes the write
+                existing["also_reads"] = existing.get("source_location")
+                existing.update(relation="writes", context="field",
+                                source_location=fa.get("source_location"))
+            continue
+        by_pair[(caller, field_nid)] = edge = {
+            "source": caller,
+            "target": field_nid,
+            "relation": relation,
+            "context": "field",
+            "confidence": "INFERRED",
+            "confidence_score": 0.85,
+            "source_file": fa.get("source_file", ""),
+            "source_location": fa.get("source_location"),
+            "weight": 1.0,
+        }
+        all_edges.append(edge)
+
+
 def _resolve_rust_field_accesses(accesses, all_nodes, all_edges, _eval, _file, _same, _pick,
                                  declared_by_type) -> None:
     """Bind each `x.field` read or write, `T { field: .. }` initialiser and
@@ -10057,6 +10233,7 @@ def extract(
         all_edges.extend(result.get("edges", []))
         all_raw_calls.extend(result.get("raw_calls", []))
         all_field_accesses.extend(result.get("rust_field_accesses", []))
+        all_field_accesses.extend(result.get("c_field_accesses", []))
     # Function / method / class def ids for the cross-file indirect_call callable
     # guard. Built from the `_callable` node marker AFTER the id-remap / disambiguation
     # passes below (which rewrite node ids), so it can never go stale — see the
@@ -11274,6 +11451,12 @@ def extract(
             and not (e.get("relation") == "calls" and e["target"] in _c_fields
                      and str(e.get("source_file", "")).endswith((".c", ".h")))
         ]
+
+    _resolve_c_field_accesses(
+        [fa for fa in all_field_accesses if "c_receiver" in fa],
+        [*all_nodes, *(resolution_context_nodes or [])],
+        all_edges, [*(resolution_context_edges or [])],
+    )
 
     # Go: repoint intra-module `imports_from` edges from the synthetic
     # `go_pkg_<import path>` sink onto the imported package's file nodes.

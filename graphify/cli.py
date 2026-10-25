@@ -4518,6 +4518,8 @@ def dispatch_command(cmd: str) -> None:
                             "_ts_fields", "_ts_static_fields",
                             "_py_fixture",
                             "_rust_ret", "_rust_ret_ok", "_rust_fields", "_rust_field", "_rust_field_holds",
+                            "_c_globals", "_c_ret", "_c_field", "_c_field_type", "_c_field_type_nested",
+                            "_c_field_macros", "_c_macros", "_c_returns",
                         ):
                             if _node.get(_marker):
                                 _ctx_node[_marker] = _node[_marker]
@@ -4553,7 +4555,7 @@ def dispatch_command(cmd: str) -> None:
                         "links", _ctx_graph.get("edges", [])
                     ):
                         if _edge.get("relation") not in (
-                            "contains", "method", "inherits", "imports", "imports_from", "case_of"
+                            "contains", "method", "inherits", "imports", "imports_from", "case_of", "defines"
                         ):
                             continue
                         if not _ctx_is_ast_tier(_edge):
