@@ -1742,41 +1742,21 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
         _enforce_graph_size_cap_or_exit(gp)
         try:
-            import json as _json
-            import networkx as _nx
+            from graphify.lookup_graph import load_lookup_graph
 
-            _raw = _json.loads(gp.read_text(encoding="utf-8"))
-            if "links" not in _raw and "edges" in _raw:
-                _raw = dict(_raw, links=_raw["edges"])
             # `query` deliberately keeps the graph undirected (unlike `path` /
             # `explain`, which force directed=True): BFS/DFS here must explore
             # both callers and callees of the seed node to build useful
             # context, and forcing a DiGraph would make G.neighbors() return
             # successors only, silently dropping every caller-side result for
             # a seed with no outgoing edges. Direction is instead preserved
-            # per-edge below (mirrors graphify/build.py's _src/_tgt pattern)
-            # so the *rendering* stays correct without narrowing traversal.
-            # Keep in-file markers when present (#2309): unconditionally
-            # overwriting them with source/target would clobber the true
-            # direction of a link persisted in flipped endpoint order.
-            _raw = dict(
-                _raw,
-                links=[
-                    {
-                        **link,
-                        "_src": link.get("_src", link.get("source")),
-                        "_tgt": link.get("_tgt", link.get("target")),
-                    }
-                    for link in _raw.get("links", [])
-                ],
-            )
-            try:
-                G = json_graph.node_link_graph(_raw, edges="links")
-            except TypeError:
-                G = json_graph.node_link_graph(_raw)
+            # per-edge as `_src`/`_tgt` (mirrors graphify/build.py's pattern)
+            # so the *rendering* stays correct without narrowing traversal,
+            # in-file markers kept when present (#2309).
+            G, _raw = load_lookup_graph(gp, "query")
             try:
                 from graphify.build import graph_has_legacy_ids as _legacy
-                if _legacy(_raw.get("nodes", [])):
+                if _legacy([{"id": n, **d} for n, d in G.nodes(data=True)]):
                     print(
                         "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
                         "rebuild with `graphify extract --force` to get path-qualified IDs "
@@ -2105,20 +2085,14 @@ def dispatch_command(cmd: str) -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         _enforce_graph_size_cap_or_exit(gp)
-        _raw = json.loads(gp.read_text(encoding="utf-8"))
-        if "links" not in _raw and "edges" in _raw:
-            _raw = dict(_raw, links=_raw["edges"])
+        from graphify.lookup_graph import load_lookup_graph
         # Force directed so the renderer can recover stored caller→callee
         # direction, and multigraph so exact-pair parallel links (e.g. a
         # `references` and a `calls` edge between the same two nodes) survive load
         # instead of being silently collapsed last-writer-wins — otherwise the
         # printed relation could be one the traversed pair doesn't actually
         # carry (#2074). Local to this read; serve's shared graph is untouched.
-        _raw = {**_raw, "directed": True, "multigraph": True}
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
+        G, _raw = load_lookup_graph(gp, "path")
         src_nid, src_scored, src_err = _resolve_path_endpoint(G, source_label)
         tgt_nid, tgt_scored, tgt_err = _resolve_path_endpoint(G, target_label)
         _warn_if_stale(gp, G, _raw.get("built_at_commit"),
@@ -2164,22 +2138,25 @@ def dispatch_command(cmd: str) -> None:
         # returned an arbitrary route among equal-length paths that varied per
         # process. Build a sorted, materialized graph so neighbor order — and
         # thus the chosen path — is canonical for a given graph.json.
+        # (lookup_graph.sorted_graph builds it as add_nodes_from and
+        # add_edges_from would, a few times faster on a large graph.)
+        from graphify.lookup_graph import edge_dicts as _edge_dicts, sorted_graph as _sorted_graph
         try:
             if undirected:
-                _und = _nx.Graph()
-                _und.add_nodes_from(sorted(G.nodes))
-                _und.add_edges_from(sorted((min(u, v), max(u, v)) for u, v in G.edges()))
+                _und = _sorted_graph(
+                    G.nodes, ((min(u, v), max(u, v)) for u, v, _d in _edge_dicts(G)),
+                    directed=False)
                 path_nodes = _nx.shortest_path(_und, src_nid, tgt_nid)
             else:
                 # Directed by default (#2487). True direction is NOT raw arc
                 # order: legacy canonicalized files persist a flipped arc with
                 # _src/_tgt markers (#2309), so build the digraph from _src/_tgt
                 # (falling back to the loaded arc) rather than to_directed().
-                _dg = _nx.DiGraph()
-                _dg.add_nodes_from(sorted(G.nodes))
-                _dg.add_edges_from(sorted(
-                    (d.get("_src", u), d.get("_tgt", v)) for u, v, d in G.edges(data=True)
-                ))
+                _arcs, _back = [], []
+                for u, v, d in _edge_dicts(G):
+                    _arcs.append((d.get("_src", u), d.get("_tgt", v)))
+                    if d.get("relation") == "contains":
+                        _back.append((d.get("_tgt", v), d.get("_src", u)))
                 # A `contains` edge only runs file -> symbol; there is no
                 # stored edge back out to the containing file, so a route that
                 # reaches a symbol (via an `imports`/`calls`/`references` hop)
@@ -2189,11 +2166,7 @@ def dispatch_command(cmd: str) -> None:
                 # (#3878). Add the implied reverse hop for traversal only — the
                 # printed segment still recovers the real stored `contains`
                 # edge and its true direction from G, same as any other hop.
-                _dg.add_edges_from(sorted(
-                    (d.get("_tgt", v), d.get("_src", u))
-                    for u, v, d in G.edges(data=True)
-                    if d.get("relation") == "contains"
-                ))
+                _dg = _sorted_graph(G.nodes, _arcs, _back, directed=True)
                 path_nodes = _nx.shortest_path(_dg, src_nid, tgt_nid)
         except (_nx.NetworkXNoPath, _nx.NodeNotFound):
             if undirected:
@@ -2247,7 +2220,7 @@ def dispatch_command(cmd: str) -> None:
             print('Usage: graphify explain "<node>" [--all | --brief] [--graph path]', file=sys.stderr)
             sys.exit(1)
         from graphify.serve import _is_ambiguity_refusal, _resolve_single_node
-        from networkx.readwrite import json_graph
+        from graphify.lookup_graph import load_lookup_graph
 
         label = sys.argv[2]
         graph_path = _default_graph_path()
@@ -2262,15 +2235,9 @@ def dispatch_command(cmd: str) -> None:
             print(f"error: graph file not found: {gp}", file=sys.stderr)
             sys.exit(1)
         _enforce_graph_size_cap_or_exit(gp)
-        _raw = json.loads(gp.read_text(encoding="utf-8"))
-        if "links" not in _raw and "edges" in _raw:
-            _raw = dict(_raw, links=_raw["edges"])
-        # Force directed so the renderer can recover stored caller→callee direction.
-        _raw = {**_raw, "directed": True}
-        try:
-            G = json_graph.node_link_graph(_raw, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(_raw)
+        # Directed, so the renderer can recover stored caller→callee direction;
+        # from the lookup cache when the graph is unchanged (lookup_graph.py).
+        G, _raw = load_lookup_graph(gp, "explain")
         nid, refusal = _resolve_single_node(G, label)
         _warn_if_stale(gp, G, _raw.get("built_at_commit"), found=[nid] if nid else (),
                        missed=nid is None and not _is_ambiguity_refusal(refusal))
