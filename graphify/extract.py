@@ -1447,7 +1447,10 @@ _GROOVY_CONFIG = LanguageConfig(
 
 _C_CONFIG = LanguageConfig(
     ts_module="tree_sitter_c",
-    class_types=frozenset(),
+    # struct / union / enum are type nodes, with their fields (`defines`) and
+    # enumerators (`case_of`), through the C++ branches: C has the same
+    # specifier nodes and `name`/`body` fields.
+    class_types=frozenset({"struct_specifier", "union_specifier", "enum_specifier"}),
     function_types=frozenset({"function_definition"}),
     import_types=frozenset({"preproc_include"}),
     call_types=frozenset({"call_expression"}),
@@ -11243,10 +11246,20 @@ def extract(
         and str(e.get("source_file", "")).endswith((".c", ".h"))
     }
     if _c_call_pairs:
+        # A C call bound by name to a struct field, a function pointer in this
+        # file or another (`gTasks[id].func(id)`, `gFlash->WaitForFlashWrite()`),
+        # is no call of the field.
+        _c_fields = {
+            e["target"] for e in all_edges
+            if e.get("relation") == "defines"
+            and str(e.get("source_file", "")).endswith((".c", ".h"))
+        }
         all_edges[:] = [
             e for e in all_edges
             if not (e.get("relation") == "indirect_call"
                     and frozenset((e["source"], e["target"])) in _c_call_pairs)
+            and not (e.get("relation") == "calls" and e["target"] in _c_fields
+                     and str(e.get("source_file", "")).endswith((".c", ".h")))
         ]
 
     # Go: repoint intra-module `imports_from` edges from the synthetic

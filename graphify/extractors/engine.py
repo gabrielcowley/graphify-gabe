@@ -2256,6 +2256,63 @@ def _c_declared_name(declarator, source: bytes) -> str | None:
     return None
 
 
+def _c_field_name(declarator, source: bytes) -> str | None:
+    """The field a C struct member declarator names, through `*`, `[]`,
+    parentheses, a bit-field and a function pointer (`void (*cb)(void)` is
+    `cb`)."""
+    node = declarator
+    while node is not None:
+        if node.type in ("field_identifier", "identifier"):
+            return _read_text(node, source)
+        inner = node.child_by_field_name("declarator")
+        if inner is None:
+            inner = next((c for c in node.named_children
+                          if c.type in ("field_identifier", "identifier")
+                          or c.type in _C_WRAPPING_DECLARATORS), None)
+        node = inner
+    return None
+
+
+def _c_attribute_recovered_name(field_decl, source: bytes) -> str | None:
+    """The real name of a C field that an attribute macro hid from the parser.
+
+    tree-sitter-c reads `u8 ALIGNED(2) name[8];` as a declarator `ALIGNED(2)`
+    and leaves `name` in an ERROR node, and `u8 UNUSED y;` as a field `UNUSED`
+    with `y` in an ERROR. A lone identifier in an ERROR there, outside a
+    parameter list, is the field the declaration names; no list of attribute
+    macros is needed. `u8 ALIGNED(4) timer;` can also come out as a field
+    `ALIGNED(4)` with no `;`, then a declaration of the type `timer` alone: the
+    name is that next declaration's. A function declarator whose parameters do
+    not parse is an attribute, never a field: "" when there is no name to
+    recover, so no field is made. None when nothing is hidden."""
+    found: list[str] = []
+    stack = [c for c in field_decl.children if c.type != "parameter_list"]
+    while stack:
+        n = stack.pop()
+        if n.type == "parameter_list":
+            continue
+        if n.type == "ERROR":
+            idents = [c for c in n.named_children if c.type in ("identifier", "field_identifier")]
+            if len(idents) == 1 and len(n.named_children) == 1:
+                found.append(_read_text(idents[0], source))
+            continue
+        stack.extend(n.children)
+    if len(found) == 1:
+        return found[0]
+    decls = list(field_decl.children_by_field_name("declarator"))
+    if len(decls) == 1 and decls[0].type == "function_declarator":
+        params = decls[0].child_by_field_name("parameters")
+        if params is not None and any(c.type == "ERROR" for c in params.children):
+            nxt = field_decl.next_named_sibling
+            if (nxt is not None and nxt.type == "field_declaration"
+                    and not nxt.children_by_field_name("declarator")):
+                ty = nxt.child_by_field_name("type")
+                if ty is not None and ty.type == "type_identifier":
+                    return _read_text(ty, source)
+            return ""
+    return None
+
+
 def _c_local_bound_names(func_def_node, source: bytes) -> set[str]:
     """Parameters and locals of a C function, for the by-name reference guard: a
     local `TaskFunc func` passed on as `CreateTask(func, 0)` is the local, not a
@@ -6159,6 +6216,18 @@ def _extract_generic(
             file_metadata["ruby_external_method_owners"] = external_owners
         file_node["metadata"] = sanitize_metadata(file_metadata)
 
+    # C: the functions this file defines, so a struct sharing a function's name
+    # (`struct CableCar` and `CableCar()` in cable_car.c) gets an id of its own
+    # rather than taking the function's.
+    c_defined_functions: set[str] = set()
+    if config.ts_module == "tree_sitter_c":
+        for top in root.named_children:
+            if top.type == "function_definition":
+                fn_name = _c_declared_name(top.child_by_field_name("declarator"), source) \
+                    or _get_cpp_func_name(top.child_by_field_name("declarator"), source)
+                if fn_name:
+                    c_defined_functions.add(fn_name)
+
     def walk(node, parent_class_nid: str | None = None) -> None:
         nonlocal ruby_singleton_context_depth
         t = node.type
@@ -6236,8 +6305,20 @@ def _extract_generic(
                 # dropped (or leaking to file scope) (#4130).
                 if config.ts_module == "tree_sitter_scala" and t == "given_definition":
                     synthetic_name = _scala_given_synthetic_name(node, source)
+                # C: `typedef struct { … } Name;` is the type `Name`.
+                if (config.ts_module == "tree_sitter_c" and node.parent is not None
+                        and node.parent.type == "type_definition"
+                        and node.child_by_field_name("body") is not None):
+                    alias = node.parent.child_by_field_name("declarator")
+                    if alias is not None and alias.type == "type_identifier":
+                        synthetic_name = _read_text(alias, source)
                 if not synthetic_name:
                     return
+            if config.ts_module == "tree_sitter_c" and node.child_by_field_name("body") is None:
+                # `struct Sprite;` or a parameter's `struct Sprite *`: a use of
+                # the type, not its definition, which would otherwise mint a
+                # node in every file that names it.
+                return
             class_name = synthetic_name if synthetic_name else _read_text(name_node, source)
             ruby_absolute_declaration = (
                 config.ts_module == "tree_sitter_ruby" and class_name.startswith("::")
@@ -6262,6 +6343,8 @@ def _extract_generic(
                 # label is untouched; arity 0 keeps today's id exactly.
                 class_name_for_id = _csharp_type_name_for_id(node, class_name)
             class_nid = _make_id(stem, ".".join(namespace_stack), class_name_for_id)
+            if config.ts_module == "tree_sitter_c" and class_name in c_defined_functions:
+                class_nid = _make_id(stem, class_name_for_id, "type")
             if config.ts_module == "tree_sitter_c_sharp":
                 # `Pair` / `_Pair` in one file share an id otherwise (#4415).
                 class_nid = _underscore_salted_nid(class_nid, class_name, csharp_type_groups)
@@ -7546,13 +7629,15 @@ def _extract_generic(
                         add_edge(parent_class_nid, target_nid, "requires", line)
             return
 
-        if (config.ts_module == "tree_sitter_cpp"
+        if (config.ts_module in ("tree_sitter_cpp", "tree_sitter_c")
                 and t == "field_declaration"
                 and parent_class_nid):
             # Skip method prototypes (field_declaration with a function_declarator
-            # is a member-function declaration, not a data member).
+            # is a member-function declaration, not a data member). C has no
+            # methods: there `void (*cb)(void)` is a function-pointer field.
+            is_c = config.ts_module == "tree_sitter_c"
             decls = list(node.children_by_field_name("declarator"))
-            is_method = any(
+            is_method = not is_c and any(
                 d.type == "function_declarator"
                 or (d.type in ("pointer_declarator", "reference_declarator")
                     and any(c.type == "function_declarator" for c in d.children))
@@ -7606,13 +7691,19 @@ def _extract_generic(
             # (a `.name()` label, a `method` edge, callable) so the declaration
             # and its out-of-line/overriding definition share one node — parity
             # with the Java/TS/Scala abstract-method contract.
+            if is_c:
+                hidden = _c_attribute_recovered_name(node, source)
+                if hidden is not None:
+                    decls = decls[:1] if hidden else []
             for decl in decls:
-                name = _get_cpp_func_name(decl, source)
+                name = _c_field_name(decl, source) if is_c else _get_cpp_func_name(decl, source)
+                if is_c and hidden:
+                    name = hidden
                 if not name:
                     continue
                 line = decl.start_point[0] + 1
                 member_nid = _make_id(parent_class_nid, name)
-                decl_is_method = (
+                decl_is_method = not is_c and (
                     decl.type == "function_declarator"
                     or (decl.type in ("pointer_declarator", "reference_declarator")
                         and any(c.type == "function_declarator" for c in decl.children))
@@ -8382,8 +8473,8 @@ def _extract_generic(
                                  parent_class_nid, add_node, add_edge, walk):
                 return
 
-        # C++ enumerators (`Red`, `Green = 2`) inside an enum / enum class body.
-        if config.ts_module == "tree_sitter_cpp":
+        # C++ and C enumerators (`Red`, `Green = 2`) inside an enum body.
+        if config.ts_module in ("tree_sitter_cpp", "tree_sitter_c"):
             if _cpp_extra_walk(node, source, file_nid, stem, str_path,
                                nodes, edges, seen_ids, function_bodies,
                                parent_class_nid, add_node, add_edge):
