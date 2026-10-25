@@ -1796,6 +1796,11 @@ def _c_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[str
         if text:
             out.append((text, "generic_arg" if generic else "type"))
         return
+    if t in ("struct_specifier", "union_specifier", "enum_specifier") \
+            and node.child_by_field_name("body") is None:
+        # `struct Sprite *sprite`: a use of the type by its tagged name
+        _c_collect_type_refs(node.child_by_field_name("name"), source, generic, out)
+        return
     if t in ("pointer_declarator", "reference_declarator", "array_declarator",
              "type_qualifier", "type_descriptor", "abstract_pointer_declarator",
              "abstract_reference_declarator", "abstract_array_declarator"):
@@ -7875,8 +7880,11 @@ def _extract_generic(
                 if type_node is not None:
                     line = node.start_point[0] + 1
                     refs: list[tuple[str, str]] = []
-                    _cpp_collect_type_refs(type_node, source, False, refs,
-                                           dialect_quals=dialect_type_quals)
+                    if is_c:
+                        _c_collect_type_refs(type_node, source, False, refs)
+                    else:
+                        _cpp_collect_type_refs(type_node, source, False, refs,
+                                               dialect_quals=dialect_type_quals)
                     for ref_name, role in refs:
                         ctx = "generic_arg" if role == "generic_arg" else "field"
                         target_nid = ensure_named_node(ref_name, line)

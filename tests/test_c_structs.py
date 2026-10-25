@@ -88,3 +88,25 @@ def test_a_struct_named_like_a_function_keeps_both(tmp_path: Path):
     labels = [n["label"] for n in nodes]
     assert "CableCar" in labels and "CableCar()" in labels
     assert ("CableCar", "defines", "timer", "L11") in edges
+
+
+def test_a_struct_named_by_its_tag_is_referenced(tmp_path: Path):
+    _nodes, edges = _graph(tmp_path)
+    # Move's parameter (here) and Use's (in use.c) name `struct Sprite`
+    assert ("Move()", "references", "Sprite", "L13") in edges
+    assert ("Use()", "references", "Sprite", "L1") in edges
+
+
+def test_a_c_header_naming_templates_stays_c(tmp_path: Path):
+    from graphify.extract import _get_extractor
+    h = tmp_path / "sprite.h"
+    h.write_text(
+        "// a class of sprites, not C++, as in Gen3::Sprite; protected: by nothing\n"
+        "struct SpriteTemplate { int tileTag; };\n"
+        "extern const struct SpriteTemplate gDummySpriteTemplate;\n",
+        encoding="utf-8",
+    )
+    assert _get_extractor(h).__name__ == "extract_c"
+    cpp = tmp_path / "box.h"
+    cpp.write_text("template <typename T> struct Box { T v; };\n", encoding="utf-8")
+    assert _get_extractor(cpp).__name__ == "extract_cpp"
