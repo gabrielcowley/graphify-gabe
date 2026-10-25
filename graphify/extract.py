@@ -9217,9 +9217,20 @@ def _is_objc_header(path: Path) -> bool:
 # C++ block when compiled as Objective-C++). `extern "C"` covers the common
 # C-API header guarded by `#ifdef __cplusplus`: the C grammar rejects the
 # linkage block and the whole header extracts zero symbols.
+# Each is C++ syntax, not a substring a C header has too: `template` alone
+# matched pokeemerald's `SpriteTemplate`, `protected:` a comment, `class ` prose,
+# and sent 17 plain C headers to the C++ extractor.
 _CPP_HEADER_MARKERS = (
-    b"class ", b"namespace ", b"template", b"::",
-    b"public:", b"private:", b"protected:", b'extern "C"',
+    re.compile(rb"\btemplate\s*<"),
+    re.compile(rb"\b(?:class|struct)\s+[A-Za-z_]\w*\s*(?:final\s*)?:\s*(?:public|private|protected)\b"),
+    re.compile(rb"^\s*class\s+[A-Za-z_]\w*\s*(?:final\s*)?[:{;]", re.M),
+    re.compile(rb"^\s*class\s+[A-Za-z_]\w*\s*$", re.M),
+    re.compile(rb"\bnamespace\s+(?:[A-Za-z_][\w:]*\s*)?\{"),
+    re.compile(rb"\bnamespace\s+[A-Za-z_]\w*\s*$", re.M),
+    re.compile(rb"\busing\s+namespace\b"),
+    re.compile(rb"\w::~?[A-Za-z_]"),
+    re.compile(rb"^\s*(?:public|private|protected)\s*:", re.M),
+    re.compile(rb'extern\s+"C(?:\+\+)?"'),
 )
 
 
@@ -9249,7 +9260,9 @@ def _is_cpp_header(path: Path) -> bool:
         head = path.read_bytes()[:256 * 1024]
     except OSError:
         return False
-    return any(marker in head for marker in _CPP_HEADER_MARKERS)
+    # Comments say "a class of", "::" in prose; only the code counts.
+    code = re.sub(rb"//[^\n]*|/\*.*?\*/", b" ", head, flags=re.S)
+    return any(marker.search(code) for marker in _CPP_HEADER_MARKERS)
 
 
 def _get_extractor(path: Path) -> Any | None:
