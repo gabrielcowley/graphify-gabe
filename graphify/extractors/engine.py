@@ -1,6 +1,7 @@
 """engine — moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
+import bisect
 import hashlib
 import importlib
 import json
@@ -2369,6 +2370,114 @@ _C_ATTRIBUTE_CALL = re.compile(
     rb"([A-Z][A-Z0-9_]*\([^()\n]*\))(?=[ \t]+\**[A-Za-z_])")
 
 
+# and a capitalised one between a declaration's type and its name, where only a
+# macro can stand: `static bool8 UNUSED TakeBerryPowder_(u32 cost)`. A keyword
+# is no type there: in `static const INIT_PARAM sX` or `struct FOO x` the
+# capitals are the type.
+_C_INNER_MACRO = re.compile(
+    rb"(?m)^([ \t]*(?:(?:static|inline|const|volatile)[ \t]+)*"
+    rb"(?:(?:struct|union|enum)[ \t]+)?"
+    rb"(?!(?:static|inline|const|volatile|extern|register|struct|union|enum|return|"
+    rb"typedef|signed|unsigned|long|short|goto|case|else|sizeof)\b)[A-Za-z_]\w*[ \t*]+)"
+    rb"([A-Z][A-Z0-9_]*)(?=[ \t]+\**[A-Za-z_]\w*[ \t]*[(;=\[,])")
+
+
+_C_DIRECTIVE = re.compile(rb"^[ \t]*#[ \t]*(ifdef|ifndef|if|elif|else|endif)\b")
+_C_MACRO_LINE = re.compile(rb"^[ \t]*[A-Za-z_]\w*[ \t]*\([^;{}]*\)[ \t]*$")
+_C_CODE_NOISE = re.compile(rb'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*')
+
+
+def _c_flatten_conditionals(source: bytes, errors) -> bytes:
+    """`source` with each `#if` chain inside a top-level `{ … }` block that
+    overlaps one of `errors` (byte ranges of parse errors) reduced to the
+    branch a build defining none of the macros compiles: `#ifndef X` keeps its
+    first branch, `#ifdef X`, `#if` and `#elif` their `#else`. The directives
+    and the other branches become spaces, so offsets and lines stay.
+    tree-sitter cannot parse a chain whose branches each hold half a statement
+    (`#ifndef UBFIX` / `if (a)` / `#else` / `if (b)` / `#endif` / its body),
+    and loses the function to it. A block that parsed, and a chain at file
+    level, whose branches are whole definitions, are left alone."""
+    flat = bytearray(source)
+    blocks: list[tuple[int, int]] = []
+    # file-level `name(...)` lines with no `;`, each with the end of the block
+    # after it: `movement_type_def(MovementType_WanderAround, gMovementTypeFuncs_
+    # WanderAround)` expands to definitions, and the parser takes it for the
+    # start of the function below
+    macro_lines: list[list[int]] = []
+    depth = 0
+    block_start = None
+    in_comment = False
+    frames: list[list] = []  # [in a body, a branch kept so far, this branch kept]
+    pos = 0
+    for line in source.split(b"\n"):
+        line_end = pos + len(line)
+        m = _C_DIRECTIVE.match(line)
+        hidden = any(f[0] and not f[2] for f in frames)
+        if m and not in_comment:
+            kind = m.group(1)
+            if kind in (b"if", b"ifdef", b"ifndef"):
+                body = depth > 0 or (bool(frames) and frames[-1][0])
+                keep = kind == b"ifndef"
+                frames.append([body, keep, keep])
+                in_body = body
+            else:
+                in_body = bool(frames) and frames[-1][0]
+                if frames and kind == b"elif":
+                    frames[-1][2] = False
+                elif frames and kind == b"else":
+                    frames[-1][2] = not frames[-1][1]
+                    frames[-1][1] = True
+                elif frames and kind == b"endif":
+                    frames.pop()
+            if in_body:
+                flat[pos:line_end] = b" " * len(line)
+        elif hidden:
+            flat[pos:line_end] = b" " * len(line)
+        else:
+            code = line
+            if in_comment:
+                close = code.find(b"*/")
+                if close < 0:
+                    code = b""
+                else:
+                    code, in_comment = code[close + 2:], False
+            code = _C_CODE_NOISE.sub(b"", code)
+            while b"/*" in code:
+                head, _, tail = code.partition(b"/*")
+                close = tail.find(b"*/")
+                if close < 0:
+                    code, in_comment = head, True
+                    break
+                code = head + tail[close + 2:]
+            before = depth
+            depth = max(0, depth + code.count(b"{") - code.count(b"}"))
+            if before == 0 and depth > 0:
+                block_start = pos
+            elif before > 0 and depth == 0 and block_start is not None:
+                blocks.append((block_start, line_end))
+                for entry in macro_lines:
+                    if entry[2] < 0:
+                        entry[2] = line_end
+                block_start = None
+            if before == 0 and depth == 0 and _C_MACRO_LINE.match(code):
+                macro_lines.append([pos, line_end, -1])
+        pos = line_end + 1
+    errors = sorted(errors)
+    starts = [s for s, _e in errors]
+
+    def has_error(start: int, end: int) -> bool:
+        # an error that starts before `end` and ends after `start`
+        return any(e >= start for _s, e in errors[:bisect.bisect_right(starts, end)])
+    out = bytearray(source)
+    for start, end in blocks:
+        if has_error(start, end):
+            out[start:end] = flat[start:end]
+    for start, end, block_end in macro_lines:
+        if block_end >= 0 and has_error(start, block_end):
+            out[start:end] = b" " * (end - start)
+    return bytes(out)
+
+
 def _c_blank_attribute_macros(source: bytes) -> bytes:
     """`source` with each such macro replaced by spaces of its length, so every
     offset and line stays the same."""
@@ -2379,7 +2488,11 @@ def _c_blank_attribute_macros(source: bytes) -> bytes:
     def blank_leading(m):
         return m.group(1) + b" " * len(m.group(2))
     source = _C_ATTRIBUTE_CALL.sub(blank_leading, source)
-    return _C_LEADING_MACRO.sub(blank_leading, _C_ATTRIBUTE_MACRO.sub(blank, source))
+    source = _C_LEADING_MACRO.sub(blank_leading, _C_ATTRIBUTE_MACRO.sub(blank, source))
+    # last: `static EWRAM_DATA s16 UNUSED sX` has its type next to UNUSED only
+    # once EWRAM_DATA is gone
+    return _C_INNER_MACRO.sub(lambda m: m.group(0) if m.group(2) in _C_KEYWORDS
+                              else blank_leading(m), source)
 
 
 def _c_anonymous_type_name(type_node, source: bytes) -> str | None:
@@ -2572,6 +2685,88 @@ def _c_global_use(node, source: bytes) -> str | None:
 
 
 _C_CAPITALS = re.compile(r"^[A-Z0-9_]+$")
+
+
+def _c_function_name(declarator, source: bytes) -> str | None:
+    """The name a C function definition's declarator gives it, through `*` and
+    the parentheses of a function returning a function pointer
+    (`void (*GetGfxFunc(void))(void)`), as extract.py's `_get_c_func_name`."""
+    node = declarator
+    while node is not None:
+        if node.type == "identifier":
+            return _read_text(node, source)
+        inner = node.child_by_field_name("declarator")
+        if inner is None and node.type == "parenthesized_declarator":
+            inner = next(iter(node.named_children), None)
+        if inner is None:
+            return next((_read_text(c, source) for c in node.children
+                         if c.type == "identifier"), None)
+        node = inner
+    return None
+
+
+def _c_id_groups(root, source: bytes, stem: str) -> dict[str, set[str]]:
+    """The C file's functions and file-scope variables whose names land on one
+    id: the id recipe folds case and drops a leading or trailing underscore, so
+    `FooterHasFourOptions_` and `FooterHasFourOptions`, or `_PatchObjectPalette`
+    and `PatchObjectPalette`, would be one node. id -> names, for
+    `_c_salted_nid`."""
+    groups: dict[str, set[str]] = {}
+    stack = list(root.named_children)
+    while stack:
+        n = stack.pop()
+        name = None
+        if n.type == "function_definition":
+            name = _c_function_name(n.child_by_field_name("declarator"), source)
+        elif n.type == "declaration":
+            for d in n.children_by_field_name("declarator"):
+                v = _c_declared_name(
+                    d.child_by_field_name("declarator") if d.type == "init_declarator" else d,
+                    source)
+                if v:
+                    groups.setdefault(_make_id(stem, v), set()).add(v)
+        elif n.type.startswith("preproc_") or n.type in ("linkage_specification",
+                                                          "declaration_list", "ERROR"):
+            stack.extend(n.named_children)
+        if name:
+            groups.setdefault(_make_id(stem, name), set()).add(name)
+    return {nid: names for nid, names in groups.items() if len(names) >= 2}
+
+
+def _c_declared_field_names(field_decl, source: bytes) -> list[str]:
+    """The fields a C `field_declaration` declares, as the walk names them:
+    by their declarators, or the one name an attribute macro hid."""
+    decls = list(field_decl.children_by_field_name("declarator"))
+    hidden = _c_attribute_recovered_name(field_decl, source)
+    if hidden is not None:
+        return [hidden] if hidden else []
+    return [n for n in (_c_field_name(d, source) for d in decls) if n]
+
+
+def _c_field_id_groups(body, source: bytes, owner_nid: str) -> dict[str, set[str]]:
+    """`_c_id_groups` for one struct's or union's fields: `monSpriteId_` and
+    `monSpriteId` side by side would be one field node."""
+    groups: dict[str, set[str]] = {}
+    for child in body.named_children:
+        if child.type == "field_declaration":
+            for name in _c_declared_field_names(child, source):
+                groups.setdefault(_make_id(owner_nid, "field", name), set()).add(name)
+    return {nid: names for nid, names in groups.items() if len(names) >= 2}
+
+
+def _c_salted_nid(plain_nid: str, name: str, groups: dict[str, set[str]]) -> str:
+    """A C function's or global's id against `_c_id_groups`: the one name of a
+    colliding group spelled without a leading or trailing underscore keeps the
+    plain id, every other is salted, so the outcome never depends on the order
+    of the definitions. Names that differ only in case all salt."""
+    names = groups.get(plain_nid)
+    if not names:
+        return plain_nid
+    bare = [n for n in names if not n.startswith("_") and not n.endswith("_")]
+    if len(bare) == 1 and name == bare[0]:
+        return plain_nid
+    salt = hashlib.sha1(name.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
+    return _make_id(plain_nid, salt)
 
 
 def _c_local_bound_names(func_def_node, source: bytes) -> set[str]:
@@ -6248,6 +6443,21 @@ def _extract_generic(
             source = _c_blank_attribute_macros(source)
         tree = parser.parse(source)
         root = tree.root_node
+        if config.ts_module == "tree_sitter_c" and root.has_error:
+            # a definition the parser rejected may hold an `#if` chain it cannot
+            # take: flatten those, there only, and parse again
+            errors, stack = [], [root]
+            while stack:
+                n = stack.pop()
+                if n.type == "ERROR" or n.is_missing:
+                    errors.append((n.start_byte, n.end_byte))
+                elif n.has_error:
+                    stack.extend(n.children)
+            flat = _c_flatten_conditionals(source, errors)
+            if flat != source:
+                source = flat
+                tree = parser.parse(source)
+                root = tree.root_node
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
@@ -6493,11 +6703,13 @@ def _extract_generic(
     c_global_uses: dict[tuple[str, str], dict] = {}
     c_node_markers: dict[str, dict] = {}
     c_type_labels: dict[str, str] = {}  # a C type's label, for its fields' `Type.field`
+    c_id_groups: dict[str, set[str]] = {}
+    c_field_id_groups: dict[tuple[str, int], dict[str, set[str]]] = {}  # per struct body
     if config.ts_module == "tree_sitter_c":
+        c_id_groups = _c_id_groups(root, source, stem)
         for top in root.named_children:
             if top.type == "function_definition":
-                fn_name = _c_declared_name(top.child_by_field_name("declarator"), source) \
-                    or _get_cpp_func_name(top.child_by_field_name("declarator"), source)
+                fn_name = _c_function_name(top.child_by_field_name("declarator"), source)
                 if fn_name:
                     c_defined_functions.add(fn_name)
 
@@ -7992,6 +8204,12 @@ def _extract_generic(
                 # would share `..._battletv_side`, losing one of the two
                 member_nid = (_make_id(parent_class_nid, "field", name) if is_c
                               else _make_id(parent_class_nid, name))
+                if is_c and node.parent is not None:
+                    key = (parent_class_nid, node.parent.start_byte)
+                    if key not in c_field_id_groups:
+                        c_field_id_groups[key] = _c_field_id_groups(
+                            node.parent, source, parent_class_nid)
+                    member_nid = _c_salted_nid(member_nid, name, c_field_id_groups[key])
                 decl_is_method = not is_c and (
                     decl.type == "function_declarator"
                     or (decl.type in ("pointer_declarator", "reference_declarator")
@@ -8164,6 +8382,8 @@ def _extract_generic(
                     func_nid = _underscore_salted_nid(
                         func_nid, sanitized_name, python_underscore_groups
                     )
+                elif config.ts_module == "tree_sitter_c":
+                    func_nid = _c_salted_nid(func_nid, sanitized_name, c_id_groups)
                 add_node(func_nid, f"{func_name}()", line)
                 add_edge(file_nid, func_nid, "contains", line)
             callable_def_nids.add(func_nid)  # function / method def is callable
@@ -10709,7 +10929,7 @@ def _extract_generic(
                         source)
                     if not name or name in c_var_nids or name in c_defined_functions:
                         continue
-                    nid = _make_id(stem, name)
+                    nid = _c_salted_nid(_make_id(stem, name), name, c_id_groups)
                     if nid in seen_ids:
                         continue
                     line = d.start_point[0] + 1
