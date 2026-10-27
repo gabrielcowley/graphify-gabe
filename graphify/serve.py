@@ -2260,7 +2260,9 @@ def _same_file_ambiguity_message(G: nx.Graph, label: str, hits: list[str]) -> st
         f"  {G.nodes[h].get('source_location') or G.nodes[h].get('label', h)}{o}\n    id: {h}"
         for h, o in zip(hits, owners)
     )
-    retry = ("Retry with the Owner::member form shown, or the full node id."
+    # The first sentence is the one this message has always ended with, which
+    # tests and hooks match on.
+    retry = ("Retry with the full node id. The Owner::member form shown picks one too."
              if any(owners) else "Retry with the full node id.")
     return (
         f"{_AMBIGUOUS}'{label}' matches {len(hits)} nodes {where}.\n"

@@ -127,7 +127,7 @@ def test_twins_in_one_file_are_listed_by_owner(monkeypatch, tmp_path, capsys):
     out, code = _explain(monkeypatch, capsys, _write(tmp_path), "src/x.rs::.nonce()")
     assert code == EXIT_AMBIGUOUS
     assert "Alpha::nonce" in out and "Beta::nonce" in out
-    assert "Retry with the Owner::member form shown" in out
+    assert "Retry with the full node id. The Owner::member form shown picks one too." in out
 
 
 def test_an_unknown_owner_is_an_ordinary_miss(monkeypatch, tmp_path, capsys):
