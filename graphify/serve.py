@@ -1703,6 +1703,136 @@ def _resolve_python_qualified(G: nx.Graph, label: str) -> list[str]:
     return []
 
 
+# `Type::member` or `Type.member` (`SidesApart::observe`, `Field::PlayerX`,
+# `Game.overrun_frames_owed`, `Sprite.x`): a member named by its owner, as Rust
+# and C++ spell a method or a variant and C, Python or JS a field. A method's
+# label is `.name()` and a variant's its bare name, so neither form matched any
+# label, and a miss suggested the type and its fields but not its methods.
+_MEMBER_RE = re.compile(r"^([A-Za-z_]\w*)(?:::|\.)\.?([A-Za-z_]\w*)(?:\(\))?$")
+# The edges from an owner to its members: methods, enum variants (`case_of`), C
+# struct fields (`defines`) and Rust struct fields (`contains`, which also joins
+# a file to its items, so a `contains` member must carry the owner's name).
+_MEMBER_RELATIONS = frozenset({"method", "case_of", "defines", "contains"})
+
+
+def _member_relations(G: nx.Graph, owner: str, member: str) -> set[str]:
+    """The relations of the edges from *owner* to *member*. `_read_graph` always
+    loads a directed graph, so an owner's members are its successors; a graph
+    built undirected by hand is read either way round."""
+    pairs = [(owner, member)] if G.is_directed() else [(owner, member), (member, owner)]
+    found: set[str] = set()
+    for u, v in pairs:
+        data = G.get_edge_data(u, v)
+        if not data:
+            continue
+        # A multigraph keys its parallel edges; a plain graph holds one dict.
+        for d in (data.values() if G.is_multigraph() else (data,)):
+            if d.get("relation"):
+                found.add(str(d["relation"]))
+    return found & _MEMBER_RELATIONS
+
+
+def _member_name(member_label: str, owner_label: str) -> str:
+    """A member's own name: `.observe()` -> `observe`, `Game.overrun_frames_owed`
+    -> `overrun_frames_owed`, `PlayerX` -> `PlayerX`."""
+    name = member_label.removesuffix("()").lstrip(".")
+    prefix = owner_label.removesuffix("()") + "."
+    return name[len(prefix):] if name.startswith(prefix) else name
+
+
+def _is_member(G: nx.Graph, owner: str, nid: str) -> bool:
+    relations = _member_relations(G, owner, nid)
+    if not relations:
+        return False
+    if relations == {"contains"}:
+        owner_label = str(G.nodes[owner].get("label") or "").removesuffix("()")
+        return str(G.nodes[nid].get("label") or "").startswith(owner_label + ".")
+    return True
+
+
+def _members_of(G: nx.Graph, owner: str) -> list[str]:
+    """The methods, variants and fields of the node *owner*, in edge order."""
+    others = G.successors(owner) if G.is_directed() else G.neighbors(owner)
+    return [nid for nid in others if nid != owner and _is_member(G, owner, nid)]
+
+
+def _owner_of(G: nx.Graph, nid: str) -> str | None:
+    """The type a method, variant or field belongs to, when one does."""
+    others = G.predecessors(nid) if G.is_directed() else G.neighbors(nid)
+    return next((o for o in others if o != nid and _is_member(G, o, nid)), None)
+
+
+def _member_owners(G: nx.Graph, owner_name: str) -> list[str]:
+    """The nodes an owner name names exactly: `SidesApart`, or every `Field`."""
+    term = " ".join(_search_tokens(owner_name))
+    norm = _strip_diacritics(owner_name).lower().strip()
+    source_exact, exact = _exact_tiers(G, term, norm)
+    # A generic type's `impl` is labelled with its parameters (`TurnTracer<R>`),
+    # which nobody types in front of `::`, and it can be a node of its own beside
+    # the struct: the struct holds the fields, the `impl` the methods.
+    generic = [nid for nid, d in G.nodes(data=True)
+               if str(d.get("label") or "").endswith(">")
+               and _bare_type(str(d.get("label") or "")).lower() == norm]
+    return list(dict.fromkeys((exact or source_exact) + generic))
+
+
+def _bare_type(label: str) -> str:
+    """A type's label without its generic parameters: `TurnTracer<R>` -> `TurnTracer`."""
+    return label.split("<", 1)[0] if label.endswith(">") else label
+
+
+def _resolve_member(G: nx.Graph, label: str) -> list[str]:
+    """The members `Owner::member` or `Owner.member` names, over every node the
+    owner name matches. `Field::PlayerX` picks report.rs's `Field` out of seven,
+    because only it has a `PlayerX`."""
+    m = _MEMBER_RE.match(label.strip())
+    if not m:
+        return []
+    owner_name, member = m.group(1), m.group(2).lower()
+    found: list[str] = []
+    for owner in _member_owners(G, owner_name):
+        owner_label = str(G.nodes[owner].get("label") or "")
+        for nid in _members_of(G, owner):
+            name = _member_name(str(G.nodes[nid].get("label") or ""), owner_label)
+            if name.lower() == member:
+                found.append(nid)
+    return list(dict.fromkeys(found))
+
+
+def _member_miss_message(G: nx.Graph, label: str) -> str | None:
+    """For `Owner::member` whose owner exists and has no such member: the owner's
+    members, those sharing a word with the name first. None when the label is not
+    of that form, or no owner by that name has members."""
+    m = _MEMBER_RE.match(label.strip())
+    if not m:
+        return None
+    owners = [o for o in _member_owners(G, m.group(1)) if _members_of(G, o)]
+    if not owners:
+        return None
+    words = _name_words(m.group(2))
+    listed: list[str] = []
+    for owner in owners:
+        members = _members_of(G, owner)
+        owner_label = str(G.nodes[owner].get("label") or "")
+        sharing = [
+            nid for nid in members
+            if any(_words_match(w, lw) for w in words
+                   for lw in _name_words(_member_name(str(G.nodes[nid].get("label") or ""), owner_label)))
+        ]
+        listed += sharing + [nid for nid in members if nid not in sharing]
+    names = ", ".join(dict.fromkeys(
+        sanitize_label(_bare_type(str(G.nodes[o].get("label") or o))) for o in owners))
+    listing = _candidate_listing(G, listed, 12).rsplit("\n", 1)[0]
+    example_owner = _owner_of(G, listed[0])
+    example = (f"{sanitize_label(_bare_type(str(G.nodes[example_owner].get('label') or '')))}::"
+               f"{sanitize_label(_member_name(str(G.nodes[listed[0]].get('label') or ''), str(G.nodes[example_owner].get('label') or '')))}"
+               if example_owner else sanitize_label(str(G.nodes[listed[0]].get("label") or "")))
+    return (
+        f"No node matching '{label}' found. {names} has no member '{m.group(2)}'; "
+        f"its members:\n{listing}\nRetry with Owner::member (e.g. {example}) or the full node id."
+    )
+
+
 def _find_node_tiers(
     G: nx.Graph, label: str, *, winning_tier_only: bool = False
 ) -> tuple[list[str], list[str], list[str], list[str]]:
@@ -1757,6 +1887,13 @@ def _find_node_tiers(
         scoped = _resolve_python_qualified(G, label)
         if scoped:
             return scoped, [], [], []
+
+    # `Owner::member` / `Owner.member`, after the path and Python forms so a real
+    # file path or module keeps the meaning it had. Nothing found falls through.
+    if _MEMBER_RE.match(label.strip()) and not _label_has_literal_exact_match(G, term, norm_query):
+        members = _resolve_member(G, label)
+        if members:
+            return members, [], [], []
 
     if not term:
         return [], [], [], []
@@ -2009,6 +2146,9 @@ def _resolve_single_node(G: nx.Graph, label: str) -> tuple[str | None, str | Non
     source_exact, exact, prefix, substring = _find_node_tiers(G, label, winning_tier_only=True)
     if not (source_exact or exact or prefix):
         if not substring:
+            member_miss = _member_miss_message(G, label)
+            if member_miss:
+                return None, member_miss
             miss = f"No node matching '{label}' found."
             shared = _shared_word_matches(G, label)
             if shared:
@@ -2105,14 +2245,27 @@ def _ambiguity_message(G: nx.Graph, label: str, rivals: list[str]) -> str:
 def _same_file_ambiguity_message(G: nx.Graph, label: str, hits: list[str]) -> str:
     source = G.nodes[hits[0]].get("source_file")
     where = f"in {source}" if source else "with no source file"
+    def owned(h: str) -> str:
+        # A member twin names its owner, which is the form that picks it:
+        # `SidesApart::observe` for one of a file's five `.observe()`s.
+        owner = _owner_of(G, h)
+        if owner is None:
+            return ""
+        owner_label = str(G.nodes[owner].get("label") or "")
+        name = _member_name(str(G.nodes[h].get("label") or ""), owner_label)
+        return f"  {sanitize_label(_bare_type(owner_label))}::{sanitize_label(name)}"
+
+    owners = [owned(h) for h in hits]
     listing = "\n".join(
-        f"  {G.nodes[h].get('source_location') or G.nodes[h].get('label', h)}\n    id: {h}"
-        for h in hits
+        f"  {G.nodes[h].get('source_location') or G.nodes[h].get('label', h)}{o}\n    id: {h}"
+        for h, o in zip(hits, owners)
     )
+    retry = ("Retry with the Owner::member form shown, or the full node id."
+             if any(owners) else "Retry with the full node id.")
     return (
         f"{_AMBIGUOUS}'{label}' matches {len(hits)} nodes {where}.\n"
         f"{listing}\n"
-        f"Retry with the full node id."
+        f"{retry}"
     )
 
 

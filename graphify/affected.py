@@ -235,6 +235,11 @@ def resolve_seed_with_candidates(
     ]
     if unique(contains_matches):
         return contains_matches[0], 0
+    # `Type::member` / `Type.member`, as `explain` and `path` take it: a method,
+    # variant or field named by its owner. Imported here, as serve imports this.
+    from graphify.serve import _resolve_member
+    if unique(_resolve_member(graph, query)):
+        return _resolve_member(graph, query)[0], 0
     return None, widest
 
 
